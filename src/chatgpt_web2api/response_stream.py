@@ -10,11 +10,14 @@
 ``docs/send-post-stream-protocol.md``；改协议必须先有新帧）：
 
 - SSE framing（``data:`` 行 + 空行分帧 + 可选 ``event:`` 行）；
-- payload 是对话树上的 JSON-Patch（``delta_encoding: "v1"``），四种形态：
+- payload 是对话树上的 JSON-Patch（``delta_encoding: "v1"``），五种形态：
   1. ``{"c":N,"p":"","o":"add","v":{"message":{...}}}``  完整 op 首条 add
   2. ``{"c":N,"v":{"message":{...}}}``                   裸 add（省略 p/o）
   3. ``{"c":N,"o":"patch","v":[op,...]}``                批量 op
   4. ``{"c":N,"p":"/message/...","o":"append"|"replace","v":...}`` 单 op
+  5. ``event: delta`` + ``{"v":"<文本>"}``               纯文本 delta 帧
+     （长回答正文经此流式传输，与 patch append 拼接连续——S3 实测：
+     patch 里 "…Ramsey-the" 接 delta "ory fact…"）；
 - ``/message/...`` patch 打在**最近加入的那条 message**上（S1/S7 双流
   交叉验证；流里会先加入大量回声消息，含早期 assistant 消息）；
 - ``{"type":"input_message",...}`` 事件对 system/user 消息都会出现
@@ -116,6 +119,7 @@ class SendStreamParser:
         self.invalid_frame_count = 0
         self.valid_frame_count = 0
         self.orphan_op_count = 0  # /message patch 却没有可用的 target
+        self.delta_frame_count = 0
         self.metadata_op_count = 0
         self.other_op_count = 0
         self.message_overflow_count = 0
@@ -219,6 +223,16 @@ class SendStreamParser:
             # 形态 4：单 op。
             self._apply_op(obj)
             return
+        if (
+            isinstance(obj.get("v"), str)
+            and "p" not in obj
+            and "o" not in obj
+            and "type" not in obj
+        ):
+            # 形态 5：event: delta 纯文本帧——当前流式消息正文（S3 实测，
+            # 与 patch append 拼接连续）。计入 target 的 parts[0]。
+            self._append_delta_text(obj["v"])
+            return
 
         t = obj.get("type")
         if t == "input_message":
@@ -239,6 +253,22 @@ class SendStreamParser:
             self.conversation_id = str(obj["conversation_id"])
 
     # ── 对话树状态机 ──────────────────────────────────────────
+
+    def _append_delta_text(self, piece: str) -> None:
+        """形态 5：把 delta 帧文本接到当前 target 的 parts[0]（S3 实测语义）。"""
+        self.delta_frame_count += 1
+        target = self._messages.get(self._target_id) if self._target_id else None
+        if target is None:
+            self.orphan_op_count += 1
+            return
+        target.received_stream_ops = True
+        while len(target.parts) < 1:
+            target.parts.append(None)
+        cur = target.parts[0] or ""
+        if len(cur) + len(piece) <= _MAX_TEXT_PER_MESSAGE:
+            target.parts[0] = cur + piece
+        else:
+            target.text_truncated = True
 
     def _add_message(self, m: object) -> None:
         if not isinstance(m, dict):
@@ -385,6 +415,7 @@ class SendStreamParser:
             "valid_frames": self.valid_frame_count,
             "invalid_frames": self.invalid_frame_count,
             "orphan_ops": self.orphan_op_count,
+            "delta_frames": self.delta_frame_count,
             "metadata_ops": self.metadata_op_count,
             "other_ops": self.other_op_count,
             "message_overflows": self.message_overflow_count,

@@ -36,6 +36,8 @@ data: {"c":0,"p":"","o":"add","v":{"message":{...role:system...}}}
 data: {"c":1,"v":{"message":{...role:user...}}}          ← 裸 add（省略 p/o）
 data: {"type":"input_message","input_message":{"id":"<msg id>","author":{"role":"user"},...}}
 data: {"c":N,"v":{"message":{...role:assistant,"status":"in_progress"...}}}
+event: delta
+data: {"v":"<正文 delta，与 patch append 拼接连续>"}
 data: {"c":N+1,"o":"patch","v":[
         {"p":"/message/content/parts/0","o":"append","v":"<text>"},
         {"p":"/message/status","o":"replace","v":"finished_successfully"},
@@ -51,12 +53,19 @@ data: [DONE]
 - JSON-Patch 四种形态：完整 op `{"c","p","o","v"}`、裸 add
   `{"c","v":{"message":...}}`、批量 `{"c","o":"patch","v":[op,...]}`、
   单 op `{"c","p","o","v"}`。`c` 是 0 起的 op 序号。
+- **第五种形态（S3 实测，2026-09-28 矩阵跑出）**：`event: delta` +
+  裸 `{"v":"<文本>"}` ——长回答正文经此流式传输，与 patch append
+  **拼接连续**（patch 里 "…Ramsey-the" 接 delta "ory fact…"）；
+  短回答的最后一个字符也可能走 delta（S4 实测：漏掉 delta 帧会丢
+  结尾 `}`）。语义 = 追加到当前流式消息的 content parts[0]。
 - 流内会先加入大量**回声消息**（本对话树上的 system/user/中间消息，
   含早期 assistant 消息，加入时即带 `finished_successfully`）。
 - `/message/...` patch 打在**最近加入的那条 message** 上
   （双流交叉验证；终态 batch 之后还可能出现零散单 op，如 metadata replace）。
 - 助手文本 = 对当前 assistant 消息 `/message/content/parts/<n>` 的
-  `append` 累加（parts 初始为 `[""]`）。
+  `append` + `event: delta` 帧的累加（parts 初始为 `[""]`）。
+- canvas 类回答（S2 实测）：`:::writing{variant="document" ...}` 块头
+  出现在 parts[0]，正文经 delta 帧续流。
 - `input_message` 事件**对 system 消息也会出现**；user 归属锚点必须按
   `author.role == "user"` 过滤。
 - `resume_conversation_token` 事件携带 JWT：解析后不得留存。
@@ -84,7 +93,16 @@ clone/读取端只拿到 `AbortError`，EOF 不会到达。因此：
 主流的 `message_stream_complete` / `conversation_detail_metadata` 事件带
 `conversation_id`；finalize POST 的 request body 也带，可交叉校验。
 
-## 5. 实现
+## 5. 已知边界（S8 实测，2026-09-28）
+
+图像生成类 turn（non-text）：主流 SSE 里只有 metadata 事件
+（`message_stream_complete` 也可能出现）但**没有** assistant 消息达到
+终态三条件——流内不存在可关联的文本终态。同时 production 的 DOM
+完成检测也在该场景 90s stall（3/3 复现）。**非文本 turn 的完成判定
+是两条路径共同的未解问题**，Commit C 设计 production 生命周期时必须
+单独处理（不能假设流内终态总是存在）。
+
+## 6. 实现
 
 - 解析器：`src/chatgpt_web2api/response_stream.py`（纯增量、无 I/O；
   任意 chunk 边界；终态/EOF 规则由 `tests/test_response_stream.py` 锁定）。

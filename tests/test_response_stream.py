@@ -92,6 +92,25 @@ def test_s7_real_stream_is_matched():
     assert p.user_message_id and p.assistant_message_id and p.conversation_id
 
 
+def test_s3_real_stream_delta_frames_reconstruct_full_text():
+    """形态 5（event: delta 纯文本帧）：长回答正文经此流式传输。
+
+    S3 实测：patch append 在词中间切到 delta 帧继续（"Ramsey-the" +
+    "ory fact"），且最后一个字符也可能走 delta（S4 实测丢 "}" 事故）。
+    parser 必须把 delta 帧接进当前 target 的 parts[0]，重建完整正文。
+    """
+    ct, chunks = load_fixture_chunks("s3_main_stream.json")
+    p = parse_all(ct, chunks)
+    assert p.outcome() == "matched"
+    assert p.delta_frame_count > 0
+    # patch 与 delta 的拼接连续性（词中切换）+ 流中后段内容必须都在。
+    assert "Ramsey-theory fact" in p.assistant_text
+    assert "pigeonhole" in p.assistant_text
+    assert "boxed" in p.assistant_text
+    assert p.user_message_id and p.assistant_message_id and p.conversation_id
+    assert p.invalid_frame_count == 0
+
+
 def test_byte_by_byte_feed_same_result():
     """任意 chunk 边界：逐字节喂与整块喂的观测结果完全一致。"""
     ct, chunks = load_fixture_chunks("s1_main_stream.json")

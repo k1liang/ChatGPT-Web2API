@@ -316,7 +316,7 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cdp-port", type=int, default=9222)
     parser.add_argument("--timeout", type=float, default=180.0)
-    group = parser.add_mutually_exclusive_group(required=True)
+    group = parser.add_mutually_exclusive_group()
     group.add_argument("--pilots", action="store_true", help="smoke：仅 S1 + S7")
     group.add_argument("--full", action="store_true", help="全场景")
     parser.add_argument(
@@ -353,6 +353,8 @@ async def main() -> int:
             print(f"REFUSED: unknown scenarios {unknown}; known={list(SCENARIOS.keys())}")
             return 2
         scenario_ids = requested
+    elif not args.pilots and not args.full:
+        parser.error("one of --pilots / --full / --scenarios is required")
     repeats = max(1, int(args.repeats))
     run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(OUTPUT_ROOT, run_id)
