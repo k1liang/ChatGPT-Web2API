@@ -427,6 +427,129 @@ def parser_fingerprint() -> dict:
     return fp
 
 
+def _collect_run_files(run_dir: str) -> tuple[list[str], list[str]]:
+    """replay / prefix-check 共用的输入收集（whitelist + 内容形态校验）。
+
+    输入 whitelist：原始 run 文件是 live 跑出的 ``<sid>_r<k>.json``。**不能**
+    用 blacklist——离线工具自己的产物（replay-attempts.json 等）落在同一
+    目录里，第二次运行会把自己的 artifact 当输入（评审 P1：replay
+    必须可重复执行）。whitelist 之外再校验内容形态，双保险。
+    返回 (合法 run 文件路径列表, 被跳过的文件名列表)。
+    """
+    import glob
+    import re
+
+    run_file_re = re.compile(r"^.+_r\d+\.json$")
+    skipped: list[str] = []
+    run_files: list[str] = []
+    for f in sorted(glob.glob(os.path.join(run_dir, "*.json"))):
+        base = os.path.basename(f)
+        if not run_file_re.match(base):
+            skipped.append(base)
+            continue
+        try:
+            with open(f, encoding="utf-8") as fh:
+                run = json.load(fh)
+        except Exception:
+            skipped.append(base)
+            continue
+        if (
+            not isinstance(run, dict)
+            or not isinstance(run.get("scenario"), str)
+            or not isinstance(run.get("repeat"), int)
+            or not isinstance(run.get("turns"), list)
+        ):
+            skipped.append(base)
+            continue
+        run_files.append(f)
+    return run_files, skipped
+
+
+def prefix_check_run_dir(run_dir: str) -> int:
+    """§6 预检（纯离线）：流式 candidate 正文是否始终是最终正文的 prefix。
+
+    Commit C 的决策依据：全部真实 capture 上 ``candidate ⊑ final`` 恒成立
+    才允许 production 做增量 emit（``new_text[len(emitted):]``）；任何一个
+    违例就停止 incremental emit，第一版改为 terminal 后一次 yield 完整
+    正文（仍然 0 polling / 0 projection）。
+
+    candidate 定义：最新一条「role=assistant 且收到过 stream ops」的
+    message 的正文（echo assistant 没有 stream ops，不会成为 candidate）。
+    每个 chunk 边界取一次 candidate，最后统一对照终态 assistant_text。
+    """
+    from chatgpt_web2api.response_stream import SendStreamParser
+
+    import base64
+
+    def candidate_text(p: SendStreamParser) -> str:
+        for mid in reversed(p._order):
+            st = p._messages.get(mid)
+            if st and st.role == "assistant" and st.received_stream_ops:
+                return st.text()
+        return ""
+
+    run_files, _skipped = _collect_run_files(run_dir)
+    if not run_files:
+        print(f"REFUSED: no run files (<sid>_r<k>.json) in {run_dir}")
+        return 2
+
+    turns = 0
+    attempts_checked = 0
+    boundaries = 0
+    violations: list[dict] = []
+    for f in run_files:
+        with open(f, encoding="utf-8") as fh:
+            run = json.load(fh)
+        for turn in run.get("turns") or []:
+            turns += 1
+            for a in turn.get("page_attempts") or []:
+                cap = CapturedAttempt(a)
+                p = SendStreamParser(content_type=cap.content_type)
+                if not p.is_event_stream:
+                    continue
+                attempts_checked += 1
+                candidates: list[str] = []
+                for chunk in cap._chunks:
+                    try:
+                        p.feed(base64.b64decode(chunk.get("b64") or ""))
+                    except Exception:
+                        continue
+                    candidates.append(candidate_text(p))
+                if getattr(cap, "eof", False):
+                    p.mark_eof()
+                elif cap.error:
+                    p.mark_error(str(cap.error))
+                final = p.assistant_text
+                for i, cand in enumerate(candidates):
+                    boundaries += 1
+                    if cand and not final.startswith(cand):
+                        violations.append(
+                            {
+                                "file": os.path.basename(f),
+                                "scenario": run["scenario"],
+                                "repeat": run["repeat"],
+                                "turn": turn.get("turn_index"),
+                                "attempt": cap.attempt_id,
+                                "chunk": i,
+                                "candidate": cand[:120],
+                                "final": final[:120],
+                                "outcome": p.outcome(),
+                            }
+                        )
+
+    print(f"[prefix-check] dir={run_dir}")
+    print(
+        f"[prefix-check] turns={turns} attempts={attempts_checked} "
+        f"boundaries={boundaries} violations={len(violations)}"
+    )
+    for v in violations[:10]:
+        print(f"[prefix-check] VIOLATION {v}")
+    verdict = "PASS" if not violations else "FAIL"
+    print(f"[prefix-check] verdict={verdict} "
+          f"(PASS 才允许 Commit C 增量 emit；FAIL 则 terminal 后一次 yield)")
+    return 0 if not violations else 1
+
+
 def replay_run_dir(run_dir: str) -> int:
     """用当前 parser 重跑既有 run 目录里的原始帧，产出新的 summary。
 
@@ -438,19 +561,7 @@ def replay_run_dir(run_dir: str) -> int:
     import glob
     import re
 
-    # 输入 whitelist：原始 run 文件是 live 跑出的 <sid>_r<k>.json。**不能**
-    # 用 blacklist——replay 自己的产物（replay-attempts.json 等）落在同一
-    # 目录里，第二次 replay 会把自己的 artifact 当输入（评审 P1：replay
-    # 必须可重复执行）。whitelist 之外再校验内容形态，双保险。
-    run_file_re = re.compile(r"^.+_r\d+\.json$")
-    skipped: list[str] = []
-    run_files: list[str] = []
-    for f in sorted(glob.glob(os.path.join(run_dir, "*.json"))):
-        base = os.path.basename(f)
-        if not run_file_re.match(base):
-            skipped.append(base)
-            continue
-        run_files.append(f)
+    run_files, skipped = _collect_run_files(run_dir)
     if not run_files:
         print(f"REFUSED: no run files (<sid>_r<k>.json) in {run_dir}")
         return 2
@@ -607,11 +718,21 @@ async def main() -> int:
         help="离线回放既有 run 目录（用当前 parser 重跑原始帧）：不联网、"
         "不需要门禁、不烧额度；产出 replay-summary.{json,md} 与 replay-diff.md",
     )
+    parser.add_argument(
+        "--prefix-check",
+        type=str,
+        default=None,
+        metavar="RUN_DIR",
+        help="§6 预检（纯离线）：验证流式 candidate 正文始终是最终正文的 "
+        "prefix——PASS 才允许 production 增量 emit",
+    )
     args = parser.parse_args()
 
     # 离线回放：只读本地帧，不接触账号，因此不要求实验门禁。
     if args.replay:
         return replay_run_dir(args.replay)
+    if args.prefix_check:
+        return prefix_check_run_dir(args.prefix_check)
 
     if os.getenv("W2A_STREAM_EXPERIMENT") != "1":
         print("REFUSED: set W2A_STREAM_EXPERIMENT=1 to run the real-account experiment")
