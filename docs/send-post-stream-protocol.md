@@ -18,9 +18,25 @@
 
 数量关系按 `0..N prepare/辅助 + 1..N 主流 attempt + 0..N finalize/辅助`
 理解。前端 retry 会产生多个主流 attempt（aborted + 成功）——这是
-**正常路径**，不是 ambiguous。logical turn 的结果 = 产生 in-band 终态的
-那个 attempt。attempt 序号（页面自增 aid）**不是** logical turn id；
-跨 attempt 归组以流内 `input_message`（role=user）的 message id 为准。
+**正常路径**，不是 ambiguous。
+
+### turn 归属锚点（裁决的唯一依据）
+
+attempt 序号（页面自增 aid）**不是** logical turn id。归属锚点有两个
+来源，**必须完全一致**才算这条流属于本轮：
+
+1. **request body**：主流 attempt 的 request body 里 `messages` 最后一条
+   `author.role == "user"` 的 `id`——它由前端生成，与流内 `input_message`
+   的 id **相同**（S5/S6 实测）。页面 hook 在 fetch 时直接提取该 id
+   （``req_user_msg_id``），因为 Python 侧只保留 body 前缀、长对话会被
+   截断；
+2. **流内** ``input_message``（role=user）事件的 id。
+
+裁决 = 「到终态 且 in_band == request body 的 user id」（调用方若知道
+当前 turn 的期望 user id，还必须与之相等），多个通过者取**最后一个**
+（retry 的最终赢家）。**没有任何锚点 = 拒绝**（``no_user_anchor``），
+绝不退回「取缓存里最后一个 terminal」——上一轮的 late terminal / late
+retry 掉进本轮缓存时，靠这条规则被拒。
 
 ## 2. 主流 framing
 
@@ -58,6 +74,13 @@ data: [DONE]
   **拼接连续**（patch 里 "…Ramsey-the" 接 delta "ory fact…"）；
   短回答的最后一个字符也可能走 delta（S4 实测：漏掉 delta 帧会丢
   结尾 `}`）。语义 = 追加到当前流式消息的 content parts[0]。
+  **必须同时匹配事件名**：`event: delta` 不是文本帧专用名（同一批真实
+  帧里 399 个 patch 帧也挂在该事件名下），但**所有** 218 个裸 `{"v":...}`
+  文本帧都在 `event: delta` 之下、零例外（S1/S3/S7 + 全部 capture 实测）。
+  因此判定文本帧要求「裸字符串 v」**且**事件名为 `delta`；只有前者会让
+  未来任何带字符串 `v` 的事件被误拼进正文，只有后者无法区分同一事件名
+  下的 patch 帧。出现裸字符串 v 但事件名不符 = 协议漂移信号
+  （``unrouted_delta``），正文可能已被丢弃 → **fail-close**。
 - 流内会先加入大量**回声消息**（本对话树上的 system/user/中间消息，
   含早期 assistant 消息，加入时即带 `finished_successfully`）。
 - `/message/...` patch 打在**最近加入的那条 message** 上
@@ -88,6 +111,17 @@ clone/读取端只拿到 `AbortError`，EOF 不会到达。因此：
 - 终态前收到 AbortError = 失败；
 - EOF 先于终态到达 = 协议漂移信号，不得当作完成。
 
+### fail-close 条件（宁可失败，绝不把残缺结果当成功）
+
+| outcome | 触发 | 为什么必须失败 |
+|---|---|---|
+| `text_overflow` | 终态 assistant 正文超过 1 MiB 上界被截断 | 截断的 structured output 被上层当成功使用，比失败更危险 |
+| `unrouted_delta` | 出现裸字符串 `v` 帧但事件名不是 `delta` | 正文通道被协议漂移绕过，正文可能已被静默丢弃 |
+
+两者的 ``is_terminal`` 恒为 False，裁决（``select_turn_attempt``）因此
+不会接受该 attempt。非终态消息（回声）的正文截断只计数、不 fail——
+它不进结果。
+
 ## 4. conversation_id
 
 主流的 `message_stream_complete` / `conversation_detail_metadata` 事件带
@@ -102,10 +136,29 @@ clone/读取端只拿到 `AbortError`，EOF 不会到达。因此：
 是两条路径共同的未解问题**，Commit C 设计 production 生命周期时必须
 单独处理（不能假设流内终态总是存在）。
 
-## 6. 实现
+## 6. 内存上界（production 承诺：解析完即弃）
+
+真实流会先回声大量历史 system/user/assistant 消息，每条都带整段正文；
+原样保留会让「解析完即弃」失效。规则：
+
+- 单条 message 正文 ≤ 1 MiB（``_MAX_TEXT_PER_MESSAGE``），初始
+  ``content.parts`` 与流式 append/delta 同一上界；
+- 一条 message 一旦不再是最新 target 且不是终态 assistant，其正文**立即
+  释放**（patch 只打最新 message，旧正文对状态机无用）；常驻正文 ≈
+  最新 target + 终态 assistant + 终态快照；
+- message 条数 ≤ 128（只丢最老元数据）、单行缓冲 ≤ 8 MiB（超限计数丢弃）。
+
+## 7. 实现
 
 - 解析器：`src/chatgpt_web2api/response_stream.py`（纯增量、无 I/O；
-  任意 chunk 边界；终态/EOF 规则由 `tests/test_response_stream.py` 锁定）。
+  任意 chunk 边界；终态/EOF/fail-close/内存上界由
+  `tests/test_response_stream.py` 锁定）。
 - 流观测：`src/chatgpt_web2api/page_stream_hook.py`（页面内 fetch tee，
   `Response.clone()` 旁路 + binding push；raw capture 为实验诊断通道，
-  production 应增量解析后即弃原始字节）。
+  production 应增量解析后即弃原始字节）。``Runtime.bindingCalled`` 经
+  `src/chatgpt_web2api/binding_router.py` 按 binding 名分发（多个 hook
+  共用这一个 CDP method，不得各自覆盖事件表）。
+- 离线回放：`scripts/turn_stream_experiment.py --replay <run-dir>` 用当前
+  parser 重跑既有 run 目录的原始帧（不联网、不烧额度），产出
+  `replay-summary.{json,md}` + `replay-attempts.json` + `replay-diff.md`
+  （含 parser 指纹与新旧裁决差异）。parser 改协议后**先回放再上真机**。

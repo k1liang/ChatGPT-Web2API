@@ -13,6 +13,10 @@ conversation projection 作为 normal-path final turn source？
   W2A_STREAM_EXPERIMENT=1 python scripts/turn_stream_experiment.py \
       --cdp-port 9222 --pilots
 
+离线回放（parser 改协议后不必重新调用 ChatGPT；只读本地帧，无门禁）：
+  python scripts/turn_stream_experiment.py --replay \
+      ../../../.gaifan/temp/stream-experiment/20260928-121741
+
 产出：
   .gaifan/temp/stream-experiment/<run-id>/
       S<n>_r<k>.json     每轮完整观测（含 raw body，不提交）
@@ -118,7 +122,7 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
     # Commit B: 增量 parser 对每个主流 attempt 出结构化结论——
     # 「产生 terminal 的 attempt」即 logical turn 裁决（A2.4），并与
     # production 通道（send_and_stream）拿到的文本做交叉校验。
-    stream_analysis = analyze_turn_stream(page_attempt_objs, streamed_text)
+    stream_analysis = analyze_turn_stream(page_attempt_objs, streamed_text, text)
     # 诊断：页面可见文本（判断 UI 是否显示错误横幅 / 是否有 assistant 节点）
     page_text = ""
     page_url = ""
@@ -163,50 +167,80 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
     }
 
 
-def analyze_turn_stream(attempts: list, streamed_text: str) -> dict:
-    """Commit B: 对一个 turn 的全部 page attempt 跑增量 parser。
+def analyze_turn_stream(attempts: list, streamed_text: str, prompt: str = "") -> dict:
+    """Commit B: 对一个 turn 的全部 page attempt 跑增量 parser 并裁决。
 
-    裁决规则（A2.4）：产生 terminal 的主流 attempt 为准（多个取最后）；
-    verdict 携带 in-band 归组键（input_message 的 user message id）与
-    重建文本和 production 通道文本的一致性。
+    裁决逻辑只有一份实现（``response_stream.select_turn_attempt``）：候选
+    必须是「到终态 且 user message id 与锚点完全一致」的 attempt，多个取
+    最后一个（前端 retry 的赢家）。锚点默认取 attempt 自身 request body 里
+    的 user message id（页面侧也会直接给 ``request_user_message_id``）——
+    这样上一轮的 late terminal 掉进本轮缓存时会被拒绝，而不是被当成结果。
     """
-    from chatgpt_web2api.response_stream import SendStreamParser
+    from chatgpt_web2api.response_stream import select_turn_attempt
 
-    rows = []
-    winner = None  # (attempt_id, parser)
-    for a in attempts:
-        p = SendStreamParser(content_type=a.content_type)
-        if p.is_event_stream:
-            p.feed(a.raw_bytes())
-        if a.error:
-            p.mark_error(a.error)
-        elif a.eof:
-            p.mark_eof()
-        s = p.summary()
-        rows.append({"attempt_id": a.attempt_id, **s})
-        if p.is_terminal:
-            winner = (a.attempt_id, p)
-    if winner is not None:
-        aid, p = winner
-        # production 通道（DOM/projection 提取）的文本带 UI 标签前缀
-        # （实测 "ChatGPT 说：\n\n"），stream 重建的是纯 assistant 内容，
-        # 因此校验用包含而非全等。
-        return {
-            "verdict": "matched",
-            "winning_attempt": aid,
+    sel = select_turn_attempt(attempts)
+    out = {
+        "verdict": sel.verdict,
+        "winning_attempt": getattr(sel.attempt, "attempt_id", None),
+        "user_message_id": None,
+        "assistant_message_id": None,
+        "conversation_id": None,
+        "assistant_text_len": 0,
+        "matches_production_stream": False,
+        "request_prompt_match": None,
+        "rejected": sel.rejected,
+        # 每个 attempt 的 outcome（失败时区分「根本没有 terminal」与
+        # 「terminal 前被 abort」等形态；selection verdict 会把它折叠成
+        # no_terminal，这里保留原始信号）。
+        "attempt_outcomes": [r["outcome"] for r in sel.rows if r["is_event_stream"]],
+        "attempts": sel.rows,
+    }
+    if sel.parser is None:
+        return out
+    p = sel.parser
+    out.update(
+        {
             "user_message_id": p.user_message_id,
             "assistant_message_id": p.assistant_message_id,
             "conversation_id": p.conversation_id,
             "assistant_text_len": len(p.assistant_text),
-            "matches_production_stream": (
-                bool(p.assistant_text) and p.assistant_text in streamed_text
-            ),
-            "attempts": rows,
+            # production 通道（DOM/projection 提取）的文本带 UI 标签前缀
+            # （实测 "ChatGPT 说：\n\n"），stream 重建的是纯 assistant 内容，
+            # 因此校验用包含而非全等。
+            "matches_production_stream": bool(p.assistant_text)
+            and p.assistant_text in streamed_text,
+            # 锚点自证：赢家 attempt 的 request body 里那条 user 消息就是
+            # 本轮 prompt（证明这条流确实属于本次 send）。
+            "request_prompt_match": _request_prompt_match(sel.attempt, prompt),
         }
-    # 没有 terminal 主流：记录最深刻的失败形态。
-    sse_rows = [r for r in rows if r["is_event_stream"]]
-    verdict = "no_stream" if not sse_rows else sse_rows[-1]["outcome"]
-    return {"verdict": verdict, "winning_attempt": None, "attempts": rows}
+    )
+    return out
+
+
+def _request_prompt_match(attempt, prompt: str) -> bool | None:
+    """赢家 attempt 的 request body 里最后一条 user 消息文本是否 == prompt。"""
+    if not prompt:
+        return None
+    body = getattr(attempt, "request_body", None)
+    if not isinstance(body, str):
+        return None
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return None
+    msgs = obj.get("messages") if isinstance(obj, dict) else None
+    if not isinstance(msgs, list):
+        return None
+    for m in reversed(msgs):
+        if not isinstance(m, dict):
+            continue
+        if ((m.get("author") or {}).get("role")) != "user":
+            continue
+        parts = (m.get("content") or {}).get("parts")
+        if isinstance(parts, list) and parts and isinstance(parts[0], str):
+            return parts[0] == prompt
+        return None
+    return None
 
 
 async def run_scenario(d: CDPDriver, sid: str, repeat: int, timeout: float) -> dict:
@@ -286,6 +320,14 @@ def summarize(all_runs: list[dict]) -> dict:
                     "stream_user_message_id": (turn.get("stream_analysis") or {}).get(
                         "user_message_id"
                     ),
+                    "stream_prompt_match": (turn.get("stream_analysis") or {}).get(
+                        "request_prompt_match"
+                    ),
+                    "stream_rejected": (turn.get("stream_analysis") or {}).get("rejected") or [],
+                    "stream_attempt_outcomes": (turn.get("stream_analysis") or {}).get(
+                        "attempt_outcomes"
+                    )
+                    or [],
                     "streamed_len": len(turn["streamed_text"]),
                     "dom_len": len(turn["dom_final_text"]),
                 }
@@ -297,17 +339,197 @@ def write_markdown(summary: dict, path: str) -> None:
     lines = [
         "| scenario | repeat | turn | wall_ms | projGET | 429 | page attempts | page chunks | "
         "page bytes | page EOFs | page errors | page events | stream verdict | text match | "
-        "dom asst | streamed | dom | error |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "prompt match | dom asst | streamed | dom | error |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in summary["turns"]:
         lines.append(
             "| {scenario} | {repeat} | {turn} | {wall_ms} | {projection_gets} | "
             "{projection_429s} | {page_attempts} | {page_chunks} | {page_bytes} | "
             "{page_eofs} | {page_errors} | {page_hook_events} | {stream_verdict} | "
-            "{stream_text_matches} | {dom_assistant_nodes} | "
+            "{stream_text_matches} | {stream_prompt_match} | {dom_assistant_nodes} | "
             "{streamed_len} | {dom_len} | {error} |".format(**r)
         )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# ── 离线回放（--replay）：不联网、不烧额度 ────────────────────
+
+
+class CapturedAttempt:
+    """回放用：从落盘的 attempt dict 还原 StreamAttempt 的最小接口。"""
+
+    def __init__(self, d: dict) -> None:
+        self.attempt_id = d.get("attempt_id")
+        self.content_type = d.get("content_type")
+        self.request_body = d.get("request_body")
+        self.request_user_message_id = d.get("request_user_message_id")
+        self.eof = bool(d.get("eof"))
+        self.error = d.get("error")
+        self._chunks = d.get("chunks") or []
+
+    def raw_bytes(self) -> bytes:
+        import base64
+
+        out = bytearray()
+        for c in self._chunks:
+            b64 = c.get("b64")
+            if b64:
+                try:
+                    out += base64.b64decode(b64)
+                except Exception:
+                    pass
+        return bytes(out)
+
+
+def parser_fingerprint() -> dict:
+    """当前 parser 的身份：协议/实现改动后能追到是哪份代码产出的结论。"""
+    import hashlib
+    import subprocess
+    from pathlib import Path
+
+    from chatgpt_web2api import response_stream
+
+    path = Path(response_stream.__file__)
+    fp = {
+        "parser_file": str(path),
+        "parser_sha256_16": hashlib.sha256(path.read_bytes()).hexdigest()[:16],
+        "repo_head": None,
+    }
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(path.parent),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        fp["repo_head"] = proc.stdout.strip() or None
+    except Exception:
+        pass
+    return fp
+
+
+def replay_run_dir(run_dir: str) -> int:
+    """用当前 parser 重跑既有 run 目录里的原始帧，产出新的 summary。
+
+    目的：parser 改协议后不必重新调用 ChatGPT。产物写回同一目录的
+    ``replay-summary.json`` / ``replay-summary.md``（**不覆盖**原始
+    summary——原始 summary 是「当时的 parser 说了什么」的历史记录），
+    并附 parser 指纹与新旧裁决差异。
+    """
+    import glob
+
+    run_files = [
+        f
+        for f in sorted(glob.glob(os.path.join(run_dir, "*.json")))
+        if os.path.basename(f) not in ("summary.json", "replay-summary.json")
+    ]
+    if not run_files:
+        print(f"REFUSED: no run files in {run_dir}")
+        return 2
+
+    runs = []
+    attempt_rows: list[dict] = []
+    for f in run_files:
+        with open(f, encoding="utf-8") as fh:
+            run = json.load(fh)
+        for turn in run.get("turns") or []:
+            attempts = [CapturedAttempt(a) for a in (turn.get("page_attempts") or [])]
+            turn["stream_analysis"] = analyze_turn_stream(
+                attempts, turn.get("streamed_text") or "", turn.get("prompt") or ""
+            )
+            for row in turn["stream_analysis"]["attempts"]:
+                attempt_rows.append(
+                    {
+                        "scenario": run["scenario"],
+                        "repeat": run["repeat"],
+                        "turn": turn["turn_index"],
+                        **row,
+                    }
+                )
+        runs.append(run)
+
+    summary = summarize(runs)
+    fp = parser_fingerprint()
+    summary["parser"] = fp
+    summary["replayed_from"] = os.path.abspath(run_dir)
+    # fail-close / 内存计数的逐 attempt 明细（turn 级 summary 看不到它们）。
+    summary["attempt_counters"] = {
+        "attempts": len(attempt_rows),
+        "text_overflow": sum(1 for r in attempt_rows if r.get("text_overflow")),
+        "unrouted_delta": sum(
+            1 for r in attempt_rows if r.get("unrouted_delta_frames")
+        ),
+        "max_retained_text_chars": max(
+            (r.get("retained_text_chars") or 0 for r in attempt_rows), default=0
+        ),
+        "max_assistant_text_len": max(
+            (len(r.get("assistant_text") or "") for r in attempt_rows), default=0
+        ),
+        "outcomes": sorted({r.get("outcome") for r in attempt_rows}),
+    }
+    with open(os.path.join(run_dir, "replay-attempts.json"), "w", encoding="utf-8") as f:
+        json.dump(attempt_rows, f, ensure_ascii=False, indent=2)
+
+    old = None
+    old_path = os.path.join(run_dir, "summary.json")
+    if os.path.exists(old_path):
+        with open(old_path, encoding="utf-8") as fh:
+            old = json.load(fh)
+
+    with open(os.path.join(run_dir, "replay-summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    write_markdown(summary, os.path.join(run_dir, "replay-summary.md"))
+    _write_replay_diff(summary, old, os.path.join(run_dir, "replay-diff.md"))
+
+    print(f"[replay] dir={run_dir}")
+    print(f"[replay] parser={fp['parser_sha256_16']} head={fp['repo_head']}")
+    print(f"[replay] attempts={summary['attempt_counters']}")
+    for r in summary["turns"]:
+        print(
+            "{scenario} r{repeat} t{turn}: verdict={stream_verdict} "
+            "outcomes={stream_attempt_outcomes} "
+            "text_match={stream_text_matches} prompt_match={stream_prompt_match} "
+            "rejected={stream_rejected} err={error}".format(**r)
+        )
+    return 0
+
+
+def _write_replay_diff(summary: dict, old: dict | None, path: str) -> None:
+    """新旧裁决差异表（老 summary 是旧 parser 的结论）。"""
+    lines = [
+        "# 回放差异（当前 parser vs 产出该 run 的 parser）",
+        "",
+        f"- parser: `{summary['parser']['parser_sha256_16']}` "
+        f"(head {summary['parser']['repo_head']})",
+        "",
+    ]
+    if old is None:
+        lines.append("（没有原始 summary.json，无从对比）")
+    else:
+        old_map = {
+            (r["scenario"], r["repeat"], r["turn"]): r for r in (old.get("turns") or [])
+        }
+        lines += [
+            "| scenario | repeat | turn | old verdict | new verdict | old text | new text |",
+            "|---|---|---|---|---|---|---|",
+        ]
+        for r in summary["turns"]:
+            o = old_map.get((r["scenario"], r["repeat"], r["turn"]), {})
+            if (
+                o.get("stream_verdict") == r["stream_verdict"]
+                and o.get("stream_text_matches") == r["stream_text_matches"]
+            ):
+                continue
+            lines.append(
+                "| {s} | {p} | {t} | {ov} | {nv} | {ot} | {nt} |".format(
+                    s=r["scenario"], p=r["repeat"], t=r["turn"],
+                    ov=o.get("stream_verdict"), nv=r["stream_verdict"],
+                    ot=o.get("stream_text_matches"), nt=r["stream_text_matches"],
+                )
+            )
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -339,7 +561,19 @@ async def main() -> int:
         "network=Network.getResponseBody（已被否证）；fetch=Fetch 域取流"
         "（已被否证，会卡页面）；both=network+page",
     )
+    parser.add_argument(
+        "--replay",
+        type=str,
+        default=None,
+        metavar="RUN_DIR",
+        help="离线回放既有 run 目录（用当前 parser 重跑原始帧）：不联网、"
+        "不需要门禁、不烧额度；产出 replay-summary.{json,md} 与 replay-diff.md",
+    )
     args = parser.parse_args()
+
+    # 离线回放：只读本地帧，不接触账号，因此不要求实验门禁。
+    if args.replay:
+        return replay_run_dir(args.replay)
 
     if os.getenv("W2A_STREAM_EXPERIMENT") != "1":
         print("REFUSED: set W2A_STREAM_EXPERIMENT=1 to run the real-account experiment")
