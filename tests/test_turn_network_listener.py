@@ -1,0 +1,230 @@
+"""Tests for the Phase A TurnNetworkListener (诊断专用观测器).
+
+Exercises attach lifecycle, send-POST 识别过滤、outcome 分类（captured /
+empty / unavailable / error）、淘汰策略与 take_observations 语义。全部使用
+合成 CDP 事件——不需要真实 Chrome/CDP。
+"""
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from chatgpt_web2api.turn_network_listener import (
+    TurnNetworkListener,
+    TurnNetworkObservation,
+)
+
+
+def _make_driver(get_response_body: AsyncMock | None = None):
+    d = MagicMock()
+    d._cdp_event_handlers = {}
+    d._cdp = get_response_body or AsyncMock(return_value={"result": {}})
+    return d
+
+
+def _response_received_msg(
+    *,
+    request_id: str = "req-1",
+    url: str = "https://chatgpt.com/backend-api/f/conversation",
+    status: int = 200,
+    headers: dict | None = None,
+) -> dict:
+    return {
+        "method": "Network.responseReceived",
+        "params": {
+            "requestId": request_id,
+            "response": {
+                "url": url,
+                "status": status,
+                "mimeType": "text/event-stream",
+                "headers": headers or {"Content-Type": "text/event-stream"},
+            },
+        },
+    }
+
+
+def _loading_finished_msg(request_id: str = "req-1") -> dict:
+    return {"method": "Network.loadingFinished", "params": {"requestId": request_id}}
+
+
+def _loading_failed_msg(request_id: str = "req-1", error: str = "net::ERR_FAILED") -> dict:
+    return {
+        "method": "Network.loadingFailed",
+        "params": {"requestId": request_id, "errorText": error},
+    }
+
+
+@pytest.mark.asyncio
+async def test_attach_registers_three_handlers_and_enables_network():
+    driver = _make_driver()
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    for method in (
+        "Network.responseReceived",
+        "Network.loadingFinished",
+        "Network.loadingFailed",
+    ):
+        assert method in driver._cdp_event_handlers
+    args, _ = driver._cdp.call_args
+    assert args[0] == "Network.enable"
+    assert listener.is_alive() is True
+
+    listener.detach()
+    for method in ("Network.responseReceived", "Network.loadingFinished", "Network.loadingFailed"):
+        assert method not in driver._cdp_event_handlers
+
+
+@pytest.mark.asyncio
+async def test_non_send_url_is_ignored():
+    driver = _make_driver()
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    # conversation projection GET — 不是 send POST，不跟踪。
+    msg = _response_received_msg(
+        url="https://chatgpt.com/backend-api/conversation/abc?offset=0&limit=50"
+    )
+    listener._on_response_received(msg)
+    assert listener.observation_count == 0
+    assert listener.take_observations() == []
+
+
+@pytest.mark.asyncio
+async def test_captured_body_full_lifecycle():
+    driver = _make_driver(
+        get_response_body=AsyncMock(return_value={"body": "data: hello", "base64Encoded": False})
+    )
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+
+    listener._on_response_received(
+        _response_received_msg(status=200, headers={"Content-Type": "text/event-stream"})
+    )
+    obs = listener.take_observations()
+    assert len(obs) == 1
+    assert obs[0].response_status == 200
+    assert obs[0].body_outcome == "pending"  # loading 未结束
+    # take_observations 已清空，重新喂一遍走完整 loading 路径。
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_finished(_loading_finished_msg())
+    await asyncio.sleep(0.05)  # 让 create_task 的 _fetch_body 跑完
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "captured"
+    assert obs[0].body == "data: hello"
+    assert obs[0].body_base64 is False
+    assert obs[0].body_size == len("data: hello")
+    assert obs[0].loading_finished_at is not None
+    assert listener.body_captured_count == 1
+    # take_observations 清空语义。
+    assert listener.take_observations() == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_when_get_response_body_reports_no_resource():
+    """流式响应的典型 CDP 答复 → outcome=unavailable（Phase A 关键信号）。"""
+    driver = _make_driver(
+        get_response_body=AsyncMock(
+            side_effect=Exception("No resource with given identifier found")
+        )
+    )
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_finished(_loading_finished_msg())
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "unavailable"
+    assert "No resource" in obs[0].body_fetch_error
+    assert listener.body_unavailable_count == 1
+
+
+@pytest.mark.asyncio
+async def test_error_when_get_response_body_fails_otherwise():
+    driver = _make_driver(get_response_body=AsyncMock(side_effect=RuntimeError("cdp timeout")))
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_finished(_loading_finished_msg())
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "error"
+    assert listener.body_error_count == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_body_outcome():
+    driver = _make_driver(get_response_body=AsyncMock(return_value={"body": "", "base64Encoded": False}))
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_finished(_loading_finished_msg())
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "empty"
+    assert obs[0].body_size == 0
+    assert listener.body_empty_count == 1
+
+
+@pytest.mark.asyncio
+async def test_loading_failed_marks_unavailable():
+    driver = _make_driver()
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_failed(_loading_failed_msg(error="net::ERR_ABORTED"))
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "unavailable"
+    assert obs[0].loading_failed_error == "net::ERR_ABORTED"
+
+
+@pytest.mark.asyncio
+async def test_429_headers_are_captured():
+    """限流归因头（Retry-After / x-ratelimit-*）必须进观测快照。"""
+    driver = _make_driver()
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(
+        _response_received_msg(
+            status=429,
+            headers={
+                "Content-Type": "application/json",
+                "Retry-After": "120",
+                "X-RateLimit-Remaining": "0",
+                "Set-Cookie": "secret",  # 非关注头，不收
+            },
+        )
+    )
+    (obs,) = listener.take_observations()
+    assert obs.response_status == 429
+    assert obs.response_headers == {
+        "content-type": "application/json",
+        "retry-after": "120",
+        "x-ratelimit-remaining": "0",
+    }
+
+
+@pytest.mark.asyncio
+async def test_eviction_keeps_capacity_and_prefers_terminal():
+    driver = _make_driver()
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    # 9 个 send POST：前 8 个走到终态（loadingFailed），最后一个 pending。
+    for i in range(8):
+        rid = f"req-{i}"
+        listener._on_response_received(_response_received_msg(request_id=rid))
+        listener._on_loading_failed(_loading_failed_msg(request_id=rid))
+    listener._on_response_received(_response_received_msg(request_id="req-8"))
+    obs = listener.take_observations()
+    assert len(obs) == 8
+    # 最旧的终态条目（req-0）被淘汰，pending 的 req-8 必须保留。
+    ids = [o.request_id for o in obs]
+    assert "req-0" not in ids
+    assert "req-8" in ids
+
+
+def test_to_dict_can_exclude_body():
+    obs = TurnNetworkObservation(request_id="r", url="u")
+    d = obs.to_dict(include_body=False)
+    assert d["body"] is None
+    assert d["body_outcome"] == "pending"

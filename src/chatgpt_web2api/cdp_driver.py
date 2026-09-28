@@ -396,6 +396,10 @@ class CDPDriver:
         # the driver (Layer 2), attached on connect/reconnect. Lazy-imported
         # at attach time to avoid a module-load circular dependency.
         self._identity_listener = None
+        # Phase A: turn network listener (send-POST response lifecycle 观测,
+        # 诊断专用——不改生产完成路径)。与 identity listener 同构,connect/
+        # reconnect 时 attach。
+        self._turn_network_listener = None
         # Tab isolation: the targetId of the tab this driver is attached to.
         # _owns_target records whether *we* created it: only tabs we created are
         # closed in close(), so a driver that adopted an existing tab (e.g.
@@ -464,6 +468,30 @@ class CDPDriver:
             await self._identity_listener.attach()
         except Exception as e:
             logger.warning("identity_listener_attach_failed (will degrade to dual-anchor): %s", e)
+
+    async def _attach_turn_network_listener(self) -> None:
+        """Phase A: attach (or re-attach) the turn network listener.
+
+        诊断专用观测器（见 turn_network_listener 模块 docstring）:跟踪
+        send POST ``/backend-api/f/conversation`` 的响应生命周期并尝试
+        ``Network.getResponseBody``。Best-effort——失败只降级为无观测,
+        绝不影响生产路径。
+        """
+        from .turn_network_listener import TurnNetworkListener
+
+        if self._turn_network_listener is None:
+            self._turn_network_listener = TurnNetworkListener(self)
+        self._turn_network_listener.detach()
+        try:
+            await self._turn_network_listener.attach()
+        except Exception as e:
+            logger.warning("turn_network_listener_attach_failed: %s", e)
+
+    def take_turn_network_observations(self) -> list:
+        """取走本轮 send POST 观测快照（Phase A 实验 driver / 诊断用）。"""
+        if self._turn_network_listener is None:
+            return []
+        return self._turn_network_listener.take_observations()
 
     async def connect(self) -> None:
         """Connect to Chrome's CDP and authenticate.
@@ -595,6 +623,9 @@ class CDPDriver:
         # registers its Network.requestWillBeSent handler on the dispatch
         # table (Step 1) and enables the Network domain for POST-body capture.
         await self._attach_identity_listener()
+        # Phase A: attach the diagnostic turn network listener (send-POST
+        # response lifecycle) on the same dispatch table / Network domain.
+        await self._attach_turn_network_listener()
         # Wait for the freshly-grabbed tab to actually be on chatgpt.com before
         # fetching the token — see _wait_for_chatgpt_ready. Without this the
         # fetch races the page load and returns an empty accessToken, killing
@@ -802,6 +833,8 @@ class CDPDriver:
                 logger.info("CDP reconnected on attempt %d", attempt)
                 # A2: re-attach the identity listener on the new websocket.
                 await self._attach_identity_listener()
+                # Phase A: re-attach the diagnostic turn network listener.
+                await self._attach_turn_network_listener()
                 # Success: clear CDP failure history and recover a half-open
                 # breaker. Only after refresh_token succeeds — a reconnect that
                 # reopens the socket but can't auth isn't a clean recovery.
