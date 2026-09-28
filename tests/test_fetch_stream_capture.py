@@ -134,8 +134,8 @@ def test_full_stream_capture_lifecycle():
     async def scenario():
         d = FakeDriver(
             reads=[
-                {"data": _b64("data: {\"v\": \"a\"}\n\n"), "eof": False},
-                {"data": _b64("data: [DONE]\n\n"), "eof": True},
+                {"data": _b64("data: {\"v\": \"a\"}\n\n"), "base64Encoded": True, "eof": False},
+                {"data": _b64("data: [DONE]\n\n"), "base64Encoded": True, "eof": True},
             ]
         )
         cap = FetchStreamCapture(d)
@@ -199,7 +199,7 @@ def test_empty_stream_yields_empty_outcome():
 def test_continue_falls_back_to_continue_request():
     async def scenario():
         d = FakeDriver(
-            reads=[{"data": _b64("data: x\n\n"), "eof": True}],
+            reads=[{"data": _b64("data: x\n\n"), "base64Encoded": True, "eof": True}],
             continue_response_error="method not found",
         )
         cap = FetchStreamCapture(d)
@@ -247,6 +247,33 @@ def test_to_dict_can_omit_body():
     obs.body = "data: secret\n\n"
     assert obs.to_dict(include_body=False)["body"] is None
     assert obs.to_dict(include_body=True)["body"] == "data: secret\n\n"
+
+
+def test_io_read_honours_base64_encoded_flag():
+    """回归（2026-09-28 实测）：IO.read 的 data 可能是原样文本。
+
+    忽略 ``base64Encoded`` 会对文本 chunk 抛 "Incorrect padding"，让
+    取流在第一帧就死掉（chunk_count 恒 0）。
+    """
+
+    async def scenario():
+        d = FakeDriver(
+            reads=[
+                {"data": "data: {\"v\": 1}\n\n", "base64Encoded": False, "eof": False},
+                {"data": _b64("data: [DONE]\n\n"), "base64Encoded": True, "eof": True},
+            ]
+        )
+        cap = FetchStreamCapture(d)
+        await cap.enable()
+        await _run_paused(cap, _paused_msg())
+
+        o = cap.take_observations()[0]
+        assert o.outcome == "captured"
+        assert o.chunk_count == 2
+        assert 'data: {"v": 1}' in o.body
+        assert "data: [DONE]" in o.body
+
+    asyncio.run(scenario())
 
 
 def test_cdp_error_reply_on_take_is_surfaced_not_silently_unavailable():

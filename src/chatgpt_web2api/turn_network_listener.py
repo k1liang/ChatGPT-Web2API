@@ -60,6 +60,21 @@ _BODY_FETCH_TIMEOUT = 10.0
 # x-ratelimit-*（工作计划 §14），content-type 决定 body 解析方式（§13）。
 _INTERESTING_HEADER_PREFIXES = ("x-ratelimit", "retry-after", "content-type")
 
+# CDP "请求体已不可得" 的错误文案（两种变体，实测都出现过）：
+#   "No resource with given identifier found"      —— 资源已释放；
+#   "No data found for resource with given identifier" —— 流被 abort，无残留 body。
+# 两者语义相同（CDP 手里没有这个请求的 body），归同一 outcome 桶。
+_MISSING_RESOURCE_MARKERS = (
+    "no resource with given identifier",
+    "no data found for resource with given identifier",
+)
+
+
+def _is_missing_resource_error(err: str) -> bool:
+    """该 CDP 错误是否属于「body 已不可得」（而非其他失败）。"""
+    lowered = err.lower()
+    return any(marker in lowered for marker in _MISSING_RESOURCE_MARKERS)
+
 
 @dataclass
 class TurnNetworkObservation:
@@ -270,8 +285,8 @@ class TurnNetworkListener:
                     obs.body_fetch_error = err
             elif err:
                 obs.body_fetch_error = err
-                if "no resource with given identifier" in err.lower():
-                    # CDP 对已释放的流式响应的典型答复（§13 Fetch domain 备选）。
+                if _is_missing_resource_error(err):
+                    # CDP 对已释放/已中止的流式响应的答复（§13 Fetch domain 备选）。
                     obs.body_outcome = "unavailable"
                     self.body_unavailable_count += 1
                 else:

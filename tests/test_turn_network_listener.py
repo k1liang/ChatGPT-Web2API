@@ -188,6 +188,38 @@ async def test_cdp_error_reply_is_reported_not_swallowed():
 
 
 @pytest.mark.asyncio
+async def test_no_data_found_variant_is_unavailable_not_error():
+    """实测变体（2026-09-28 修正 pilot）：send POST 被前端 abort 后 CDP 答复
+
+    ``-32000: No data found for resource with given identifier``。
+    与 "No resource with given identifier" 同义（CDP 手里没有 body），
+    必须落 unavailable，否则 §21 停止条件 1 的判定会被错误分类掩盖。
+    """
+    driver = _make_driver(
+        get_response_body=AsyncMock(
+            return_value={
+                "id": 10,
+                "error": {
+                    "code": -32000,
+                    "message": "No data found for resource with given identifier",
+                },
+            }
+        )
+    )
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_failed(_loading_failed_msg(error="net::ERR_ABORTED"))
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "unavailable"
+    assert listener.body_unavailable_count == 1
+    assert listener.body_error_count == 0
+    assert "No data found" in obs[0].body_fetch_error
+    assert obs[0].loading_failed_error == "net::ERR_ABORTED"
+
+
+@pytest.mark.asyncio
 async def test_partial_body_wins_over_error_reply():
     """错误答复里仍带部分 body 时以 body 为准（帧可用于解析）。"""
     driver = _make_driver(

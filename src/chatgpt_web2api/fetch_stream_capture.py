@@ -215,7 +215,13 @@ class FetchStreamCapture:
                 payload = cdp_result(read)
                 data = payload.get("data", "")
                 if data:
-                    chunks.append(base64.b64decode(data))
+                    # IO.read 的 data 可能是 base64，也可能是原样文本——
+                    # 由 base64Encoded 标志决定（忽略它会对文本 chunk 抛
+                    # "Incorrect padding"，2026-09-28 实测踩到）。
+                    if payload.get("base64Encoded"):
+                        chunks.append(base64.b64decode(data))
+                    else:
+                        chunks.append(data.encode("utf-8"))
                     obs.chunk_count += 1
                 if payload.get("eof"):
                     break
