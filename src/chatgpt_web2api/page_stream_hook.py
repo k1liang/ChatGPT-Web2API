@@ -35,7 +35,8 @@ EOF），wire format 由真实帧反推。
 
 事件协议（page → Python，单条 JSON 字符串）：
 
-    {"t": "fetch_seen", "aid": "a1-...", "url": ..., "method": ..., "body": ...}
+    {"t": "fetch_seen", "aid": "a1-...", "url": ..., "method": ...,
+     "body": ..., "req_user_msg_id": "<uuid|null>"}
     {"t": "response",   "aid": ..., "status": 200, "content_type": ...}
     {"t": "chunk",      "aid": ..., "index": 0, "b64": ..., "len": 123}
     {"t": "eof",        "aid": ..., "index": 42}
@@ -44,6 +45,14 @@ EOF），wire format 由真实帧反推。
 
 ``aid`` 是页面侧自增的 attempt id：一个 logical turn 可能出现多个 POST
 （前端 retry，第 1 轮 S7 实测），按 aid 分组即可，retry 属正常路径。
+
+``req_user_msg_id`` 是本轮请求里最后一条 user 消息的 id（页面侧从
+request body 提取），与流内 ``input_message`` 同 id——它是 logical turn
+裁决的锚点（见 ``response_stream.select_turn_attempt``）。页面侧提取而非
+Python 侧解析：Python 只保留 body 前缀，长对话会截断。
+
+``Runtime.bindingCalled`` 由 :class:`~.binding_router.BindingRouter` 统一
+分发（多个 hook 共用这一个 CDP method，不得各自覆盖事件表）。
 """
 
 from __future__ import annotations
@@ -106,6 +115,27 @@ _HOOK_SOURCE = r"""
     } catch (e) { return '<unreadable>'; }
   }
 
+  // 本轮请求里最后一条 user 消息的 id —— logical turn 的归属锚点。
+  // 实测它与流内 input_message 事件的 id 相同（S5/S6 capture）。
+  // 必须在页面侧取：Python 侧只保留 body 前缀，长对话会被截断，
+  // 而锚点缺失时裁决会 fail-close（宁可失败也不误认 turn）。
+  function reqUserMsgId(init) {
+    try {
+      if (!init || typeof init.body !== 'string') { return null; }
+      var b = JSON.parse(init.body);
+      var msgs = b && b.messages;
+      if (!msgs || !msgs.length) { return null; }
+      for (var i = msgs.length - 1; i >= 0; i--) {
+        var m = msgs[i];
+        if (m && m.author && m.author.role === 'user'
+            && typeof m.id === 'string' && m.id) {
+          return m.id;
+        }
+      }
+      return null;
+    } catch (e) { return null; }
+  }
+
   function observe(aid, response) {
     // clone 必须在页面消费 body 之前完成——我们的 then 回调先于页面注册，
     // 因此这里 clone 是安全的（矩阵 A2.2 第 3/6 项）。
@@ -157,7 +187,7 @@ _HOOK_SOURCE = r"""
     try {
       emit({t: 'fetch_seen', aid: aid, url: url,
             method: (init && init.method) || (input && input.method) || 'GET',
-            body: bodyText(init), ts: Date.now()});
+            body: bodyText(init), req_user_msg_id: reqUserMsgId(init), ts: Date.now()});
     } catch (e) { /* 绝不影响页面 */ }
     // 返回**原 promise 本身**（不是链式新 promise），页面拿到的对象不变。
     p.then(function (response) {
@@ -202,6 +232,10 @@ class StreamAttempt:
     url: str
     method: str | None = None
     request_body: str | None = None
+    # 页面侧提取的 turn 锚点（本请求最后一条 user 消息 id）。旧 capture
+    # 没有该字段，回退解析 request_body（见 response_stream）。
+    request_user_message_id: str | None = None
+    request_body_truncated: bool = False
     response_status: int | None = None
     content_type: str | None = None
     chunks: list[StreamChunk] = field(default_factory=list)
@@ -219,6 +253,8 @@ class StreamAttempt:
             "url": self.url,
             "method": self.method,
             "request_body": self.request_body,
+            "request_user_message_id": self.request_user_message_id,
+            "request_body_truncated": self.request_body_truncated,
             "response_status": self.response_status,
             "content_type": self.content_type,
             "chunk_count": len(self.chunks),
@@ -282,6 +318,10 @@ class PageStreamHook:
         顺序有意为之：**先 addBinding 再 addScriptToEvaluateOnNewDocument**
         —— hook 在 document start 就跑，此时 ``window.__w2aTurnStreamEvent``
         必须已经存在，否则首批事件会被静默丢掉。
+
+        半装失败必须回滚：第一步 addBinding 成功、第二步 script 失败时，
+        已注册的 binding 要撤掉（否则 ``_binding_added`` 永远是 True，
+        下次 install 会重复 addBinding）。
         """
         if self._installed:
             return True
@@ -307,7 +347,7 @@ class PageStreamHook:
             if err:
                 raise RuntimeError(f"addScriptToEvaluateOnNewDocument: {err}")
             self._script_id = _result(resp).get("identifier")
-            d._cdp_event_handlers["Runtime.bindingCalled"] = self._on_binding_called
+            d._binding_router.add(BINDING_NAME, self._on_binding_called)
             self._installed = True
             logger.info(
                 "page_stream_hook_installed binding=%s script_id=%s",
@@ -317,13 +357,21 @@ class PageStreamHook:
             return True
         except Exception as e:
             logger.warning("page_stream_hook_install_failed: %s", e)
-            self._installed = False
+            await self._teardown()
             return False
 
     async def uninstall(self) -> None:
         """摘掉 hook（当前文档里已生效的 wrapper 需 reload 才消失）。"""
+        await self._teardown()
+
+    async def _teardown(self) -> None:
+        """撤销本 hook 的全部注册（uninstall 与半装回滚共用同一条路径）。
+
+        只摘自己那一路 binding listener——router 是共享的，另一个 hook 的
+        listener 不受影响。各步失败只记日志：清理必须走到底。
+        """
         d = self._driver
-        d._cdp_event_handlers.pop("Runtime.bindingCalled", None)
+        d._binding_router.remove(BINDING_NAME, self._on_binding_called)
         if self._script_id:
             try:
                 await d._cdp(
@@ -385,23 +433,31 @@ class PageStreamHook:
         try:
             if kind == "fetch_seen":
                 body = ev.get("body")
+                truncated = False
                 if isinstance(body, str) and len(body) > _MAX_REQUEST_BODY:
                     body = body[:_MAX_REQUEST_BODY] + f"...<truncated {len(body)} bytes>"
+                    truncated = True
+                anchor = ev.get("req_user_msg_id")
                 obs = StreamAttempt(
                     attempt_id=aid,
                     url=str(ev.get("url") or ""),
                     method=ev.get("method"),
                     request_body=body,
+                    request_user_message_id=(
+                        str(anchor) if isinstance(anchor, str) and anchor else None
+                    ),
+                    request_body_truncated=truncated,
                     opened_at=time.monotonic(),
                 )
                 self._remember(obs)
                 self.fetch_seen_count += 1
                 logger.info(
-                    "page_stream fetch_seen aid=%s url=%s method=%s body_len=%s",
+                    "page_stream fetch_seen aid=%s url=%s method=%s body_len=%s user_msg=%s",
                     aid,
                     obs.url,
                     obs.method,
                     len(obs.request_body) if isinstance(obs.request_body, str) else None,
+                    obs.request_user_message_id,
                 )
             elif obs is None:
                 # 事件先于 fetch_seen 到达（或 aid 丢失）——计入错误但不抛。
@@ -486,6 +542,8 @@ class PageStreamHook:
             "eofs": self.eof_count,
             "errors": self.error_count,
             "bad_payloads": self.bad_payload_count,
+            # binding 多路分发的路由计数（诊断：事件有没有被别处截走）。
+            "binding_router": self._driver._binding_router.stats,
         }
 
 

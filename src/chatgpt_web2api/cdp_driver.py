@@ -416,6 +416,12 @@ class CDPDriver:
         # 响应流观测。默认不安装（安装会改写页面 fetch，属侵入式），仅
         # 实验/诊断显式开启；必须在 navigate 之前安装（前端会缓存 fetch 引用）。
         self._page_stream_hook = None
+        # Runtime.bindingCalled 的多路分发器：所有 binding 共用这一个 CDP
+        # method，多个 hook（流 / 未来的 DOM secondary）必须按 binding 名
+        # 路由，不能各自覆盖 _cdp_event_handlers。
+        from .binding_router import BindingRouter
+
+        self._binding_router = BindingRouter(self)
         # Tab isolation: the targetId of the tab this driver is attached to.
         # _owns_target records whether *we* created it: only tabs we created are
         # closed in close(), so a driver that adopted an existing tab (e.g.

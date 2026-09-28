@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 
+from chatgpt_web2api.binding_router import BindingRouter
 from chatgpt_web2api.page_stream_hook import (
     BINDING_NAME,
     PageStreamHook,
@@ -40,6 +41,8 @@ class FakeDriver:
         self._cdp_event_handlers: dict = {}
         self.calls: list[tuple[str, dict]] = []
         self._fail_on = fail_on
+        # 与 CDPDriver 同构：router 由 driver 持有。
+        self._binding_router = BindingRouter(self)
 
     async def _cdp(self, method: str, params: dict, timeout: float = 30):
         self.calls.append((method, dict(params)))
@@ -165,6 +168,96 @@ def test_reinstall_after_uninstall_reregisters():
         assert hook.is_installed() is True
 
     asyncio.run(scenario())
+
+
+def test_partial_install_rolls_back_binding():
+    """半装失败必须回滚：addBinding 成功、script 失败时不得留下已注册 binding。
+
+    否则 ``_binding_added`` 永远是 True，下一次 install 会重复 addBinding
+    （评审 P1）。
+    """
+
+    async def scenario():
+        d = FakeDriver(fail_on="Page.addScriptToEvaluateOnNewDocument")
+        hook = PageStreamHook(d)
+        assert await hook.install() is False
+        assert hook.is_installed() is False
+        assert hook.stats["binding_added"] is False
+        assert "Runtime.removeBinding" in d.methods()  # 第一步被撤销
+        assert "Runtime.bindingCalled" not in d._cdp_event_handlers
+
+        # 修好后重装：binding 只注册一次（回滚没有留下脏状态）。
+        d._fail_on = None
+        assert await hook.install() is True
+        assert d.methods().count("Runtime.addBinding") == 2
+        assert d.methods().count("Runtime.removeBinding") == 1
+        assert hook.is_installed() is True
+
+    asyncio.run(scenario())
+
+
+def test_uninstall_only_removes_own_binding():
+    """router 共享：摘掉流 hook 不得影响另一个 binding 的 listener（评审 P1）。"""
+
+    async def scenario():
+        d = FakeDriver()
+        other = []
+        d._binding_router.add("__w2aDomStateEvent", lambda msg: other.append(msg))
+        hook = PageStreamHook(d)
+        await hook.install()
+        assert set(d._binding_router.names()) == {BINDING_NAME, "__w2aDomStateEvent"}
+
+        await hook.uninstall()
+        assert d._binding_router.names() == ["__w2aDomStateEvent"]
+        # router 仍挂在事件表上（还有别的 listener），且仍能路由到 DOM。
+        assert "Runtime.bindingCalled" in d._cdp_event_handlers
+        d._cdp_event_handlers["Runtime.bindingCalled"](
+            {"params": {"name": "__w2aDomStateEvent", "payload": "{}"}}
+        )
+        assert len(other) == 1
+
+    asyncio.run(scenario())
+
+
+def test_fetch_seen_records_turn_anchor_and_truncation():
+    """turn 锚点（本请求最后一条 user 消息 id）随 fetch_seen 落到 attempt 上。"""
+    hook = PageStreamHook(FakeDriver())
+    hook._on_binding_called(
+        _binding_msg(
+            {
+                "t": "fetch_seen",
+                "aid": "a1",
+                "url": "u",
+                "method": "POST",
+                "body": '{"messages":[{"id":"u-1","author":{"role":"user"}}]}',
+                "req_user_msg_id": "u-1",
+            }
+        )
+    )
+    hook._on_binding_called(
+        _binding_msg({"t": "fetch_seen", "aid": "a2", "url": "u", "method": "POST",
+                      "body": "{}", "req_user_msg_id": None})
+    )
+    a1, a2 = hook.take_attempts()
+    assert a1.request_user_message_id == "u-1"
+    assert a1.request_body_truncated is False
+    assert a2.request_user_message_id is None
+
+
+def test_long_request_body_is_truncated_and_flagged(monkeypatch):
+    from chatgpt_web2api import page_stream_hook as psh
+
+    monkeypatch.setattr(psh, "_MAX_REQUEST_BODY", 20)
+    hook = PageStreamHook(FakeDriver())
+    hook._on_binding_called(
+        _binding_msg({"t": "fetch_seen", "aid": "a1", "url": "u", "method": "POST",
+                      "body": "x" * 100, "req_user_msg_id": "u-9"})
+    )
+    a = hook.take_attempts()[0]
+    assert a.request_body_truncated is True
+    assert a.request_body.startswith("x" * 20) and "truncated 100 bytes" in a.request_body
+    # 锚点在页面侧提取，body 被截断也不影响裁决。
+    assert a.request_user_message_id == "u-9"
 
 
 def test_mark_session_lost_allows_reinstall():
@@ -335,3 +428,5 @@ def test_hook_source_never_reconstructs_response():
     assert "new Response(" not in _HOOK_SOURCE
     assert "body.tee()" not in _HOOK_SOURCE
     assert "addScriptToEvaluateOnNewDocument" not in _HOOK_SOURCE  # 由 Python 侧调用
+    # turn 锚点在页面侧提取（Python 只保留 body 前缀，长对话会截断）。
+    assert "req_user_msg_id: reqUserMsgId(init)" in _HOOK_SOURCE
