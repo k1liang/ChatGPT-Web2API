@@ -303,6 +303,31 @@ class PageStreamHook:
         self.eof_count = 0
         self.error_count = 0
         self.bad_payload_count = 0
+        # Production uses the same browser hook but must not retain raw prompt
+        # bodies/chunks. Experiments can explicitly re-enable raw capture.
+        self._capture_raw = True
+        self._event_listeners: list = []
+
+    def set_raw_capture_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if self._capture_raw and not enabled:
+            # Production must not inherit diagnostic prompt/raw buffers from an
+            # earlier experiment on the same hook instance.
+            self._attempts.clear()
+            self._order.clear()
+        self._capture_raw = enabled
+
+    @property
+    def capture_raw_enabled(self) -> bool:
+        return self._capture_raw
+
+    def add_event_listener(self, listener) -> None:
+        if listener not in self._event_listeners:
+            self._event_listeners.append(listener)
+
+    def remove_event_listener(self, listener) -> None:
+        if listener in self._event_listeners:
+            self._event_listeners.remove(listener)
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -427,8 +452,34 @@ class PageStreamHook:
             self.bad_payload_count += 1
             return
         self.event_count += 1
+        # The browser binding payload contains the full request body so the
+        # diagnostic raw-capture path can persist it. Production listeners do
+        # not need it (the page already extracted req_user_msg_id), and must
+        # never queue/retain prompt bodies.
+        listener_event = ev
+        if "body" in ev:
+            listener_event = dict(ev)
+            listener_event.pop("body", None)
+        for listener in list(self._event_listeners):
+            try:
+                listener(listener_event)
+            except Exception as e:
+                self.bad_payload_count += 1
+                logger.debug("page_stream listener failed: %s", e)
+
         kind = ev.get("t")
         aid = ev.get("aid") or "<no-aid>"
+        if not self._capture_raw:
+            if kind == "fetch_seen":
+                self.fetch_seen_count += 1
+            elif kind == "chunk":
+                self.chunk_count += 1
+            elif kind == "eof":
+                self.eof_count += 1
+            elif kind in ("no_reader", "copy_error", "hook_error"):
+                self.error_count += 1
+            return
+
         obs = self._attempts.get(aid)
         try:
             if kind == "fetch_seen":
@@ -536,6 +587,12 @@ class PageStreamHook:
             "installed": self._installed,
             "script_id": self._script_id,
             "binding_added": self._binding_added,
+            "capture_raw": self._capture_raw,
+            "raw_bytes_retained": sum(
+                c.byte_len
+                for a in self._attempts.values()
+                for c in a.chunks
+            ),
             "events": self.event_count,
             "fetch_seen": self.fetch_seen_count,
             "chunks": self.chunk_count,

@@ -412,10 +412,14 @@ class CDPDriver:
         # 改由 Fetch.requestPaused + takeResponseBodyAsStream + IO.read 取流。
         # **默认不启用**（enable 会暂停请求，属侵入式），仅实验/诊断显式开启。
         self._fetch_stream_capture = None
-        # Method E（矩阵 AMENDMENT 2）: 页面内 fetch tee —— 事件驱动的真实
-        # 响应流观测。默认不安装（安装会改写页面 fetch，属侵入式），仅
-        # 实验/诊断显式开启；必须在 navigate 之前安装（前端会缓存 fetch 引用）。
+        # Method E / production stream transport: 页面内 fetch tee。
+        # PageStreamHook owns browser injection; TurnStreamRuntime owns the
+        # production logical-turn lifecycle and never retains raw response bytes.
         self._page_stream_hook = None
+        self._turn_stream_runtime = None
+        self._stream_primary_available = False
+        self._stream_primary_reason = "not_prepared"
+        self._stream_primary_stats: dict = {}
         # Runtime.bindingCalled 的多路分发器：所有 binding 共用这一个 CDP
         # method，多个 hook（流 / 未来的 DOM secondary）必须按 binding 名
         # 路由，不能各自覆盖 _cdp_event_handlers。
@@ -593,18 +597,18 @@ class CDPDriver:
             "body_fetch_scheduled": listener.body_fetch_scheduled_count,
         }
 
-    async def install_page_stream_hook(self) -> bool:
-        """Method E: 安装页面内 fetch tee（显式、侵入式，实验/诊断专用）。
+    async def install_page_stream_hook(self, *, capture_raw: bool = True) -> bool:
+        """Install the page fetch-clone transport.
 
-        必须在 **navigate 之前**调用：hook 经
-        ``Page.addScriptToEvaluateOnNewDocument`` 在 document start 执行，
-        运行时再 override ``window.fetch`` 对已初始化完的前端无效。
-        返回是否安装成功；失败只降级为无观测，不影响生产路径。
+        ``capture_raw`` is diagnostic-only. Production passes False so prompt
+        bodies and raw response chunks are never retained; experiments can
+        explicitly enable capture on the same transport.
         """
         from .page_stream_hook import PageStreamHook
 
         if self._page_stream_hook is None:
             self._page_stream_hook = PageStreamHook(self)
+        self._page_stream_hook.set_raw_capture_enabled(capture_raw)
         return await self._page_stream_hook.install()
 
     async def uninstall_page_stream_hook(self) -> None:
@@ -640,6 +644,94 @@ class CDPDriver:
         if hook is None:
             return {"installed": False}
         return hook.stats
+
+    async def _ensure_turn_stream_runtime(self):
+        """Create/start the production parser consumer without raw capture."""
+        from .page_stream_hook import PageStreamHook
+        from .turn_stream_runtime import TurnStreamRuntime
+
+        if self._page_stream_hook is None:
+            self._page_stream_hook = PageStreamHook(self)
+        if self._turn_stream_runtime is None:
+            self._turn_stream_runtime = TurnStreamRuntime(self)
+        await self._turn_stream_runtime.start(self._page_stream_hook)
+        return self._turn_stream_runtime
+
+    async def _page_stream_wrapper_present(self) -> bool:
+        try:
+            value = await self._js_strict("Boolean(window.__w2aWrappedFetch)")
+            return value is True or str(value).lower() == "true"
+        except Exception:
+            return False
+
+    async def _prepare_stream_primary_after_attach(self) -> bool:
+        """Make the event-driven textual path ready on the attached tab.
+
+        Owned tabs may be reloaded once after installing the document-start
+        hook; adopted/shared tabs are never reloaded or mutated just to enable
+        stream primary.
+        """
+        self._stream_primary_available = False
+        self._stream_primary_reason = "preparing"
+
+        if not self._owns_target:
+            if not await self._page_stream_wrapper_present():
+                self._stream_primary_reason = "adopt_unwrapped"
+                return False
+
+        hook_existed = self._page_stream_hook is not None
+        await self._ensure_turn_stream_runtime()
+        capture_raw = (
+            self._page_stream_hook.capture_raw_enabled if hook_existed else False
+        )
+        if not await self.install_page_stream_hook(capture_raw=capture_raw):
+            self._stream_primary_reason = "hook_install_failed"
+            return False
+
+        wrapped = await self._page_stream_wrapper_present()
+        if self._owns_target and not wrapped:
+            try:
+                resp = await self._cdp("Page.reload", {}, timeout=15)
+                if isinstance(resp, dict) and resp.get("error"):
+                    raise RuntimeError(f"Page.reload failed: {resp['error']}")
+                await self._wait_for_chatgpt_ready()
+            except Exception as e:
+                logger.warning("stream-primary owned-tab reload failed: %s", e)
+                self._stream_primary_reason = "reload_failed"
+                return False
+            wrapped = await self._page_stream_wrapper_present()
+
+        if not wrapped:
+            self._stream_primary_reason = "wrapper_missing"
+            return False
+        self._stream_primary_available = True
+        self._stream_primary_reason = "ready"
+        return True
+
+    def _reset_stream_primary_stats(self) -> None:
+        self._stream_primary_stats = {
+            "available": self._stream_primary_available,
+            "availability_reason": self._stream_primary_reason,
+            "completion_source": None,
+            "expected_user_id": None,
+            "winning_attempt": None,
+            "attempt_count": 0,
+            "retry_count": 0,
+            "outcome": None,
+            "protocol_drift": False,
+            "recovery_used": False,
+            "dom_poll_count": 0,
+            "completion_poll_count": 0,
+            "raw_bytes_retained": 0,
+            "stream_bytes_seen": 0,
+        }
+
+    @property
+    def stream_primary_stats(self) -> dict:
+        out = dict(self._stream_primary_stats)
+        if self._turn_stream_runtime is not None:
+            out["runtime"] = self._turn_stream_runtime.stats
+        return out
 
     @property
     def projection_stats(self) -> dict:
@@ -795,6 +887,10 @@ class CDPDriver:
         # the MCP process on startup. Best-effort: a False return falls through
         # to _refresh_token, which has its own retry loop as a safety net.
         await self._wait_for_chatgpt_ready()
+        # Production textual path: install the document-start hook, then
+        # reload only our owned tab if the current document was loaded before
+        # the hook existed. Adopted tabs are never reloaded.
+        await self._prepare_stream_primary_after_attach()
         await self._refresh_token()
         # Establish the send-readiness invariant before connect() returns: a
         # connected driver must be able to type a message. connect() may have
@@ -924,6 +1020,12 @@ class CDPDriver:
         _pre_reconnect_target_id = self._target_id
         self._current_model = None
         self._pending.clear()
+        self._stream_primary_available = False
+        self._stream_primary_reason = "reconnecting"
+        if self._page_stream_hook is not None:
+            self._page_stream_hook.mark_session_lost()
+        if self._turn_stream_runtime is not None:
+            self._turn_stream_runtime.reset_session()
 
         # Reconnect with backoff
         for attempt, delay in enumerate([2, 5, 10], 1):
@@ -992,6 +1094,7 @@ class CDPDriver:
                 # Same settle wait as connect() — the reconnected tab (re-found
                 # or re-created) may have just navigated. See _wait_for_chatgpt_ready.
                 await self._wait_for_chatgpt_ready()
+                await self._prepare_stream_primary_after_attach()
                 await self._refresh_token()
                 logger.info("CDP reconnected on attempt %d", attempt)
                 # A2: re-attach the identity listener on the new websocket.
@@ -1001,8 +1104,8 @@ class CDPDriver:
                 # Phase A 第二方案: Fetch 捕获是 websocket 级状态，重连后
                 # 必须重新 enable，否则实验中途断线会静默丢失观测。
                 await self._reattach_fetch_stream_capture()
-                # Method E: 页面流 hook 同样挂在会话上，重连后按原状态恢复。
-                await self._reinstall_page_stream_hook()
+                # Page stream binding/script were restored by
+                # _prepare_stream_primary_after_attach before auth refresh.
                 # Success: clear CDP failure history and recover a half-open
                 # breaker. Only after refresh_token succeeds — a reconnect that
                 # reopens the socket but can't auth isn't a clean recovery.
@@ -1797,7 +1900,8 @@ class CDPDriver:
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
-        from .chatgpt_dom import COMPOSER_SELECTOR, COMPOSER_FALLBACK_SELECTOR
+
+        from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:
@@ -1918,6 +2022,58 @@ class CDPDriver:
                 conversation_id_at_capture=conv_id,
             )
 
+    def _capture_projection_free_fallback_anchor(self, text: str):
+        """Fallback anchor for a stream-primary send without any backend GET."""
+        import time as _time
+
+        from .turn_anchor import TurnAnchor
+
+        conv_id = self._current_conv_id
+        return TurnAnchor(
+            sent_text=text,
+            mode="fresh_chat" if conv_id is None else "degraded_existing",
+            pre_send_wall_time=_time.time(),
+            conversation_id_at_capture=conv_id,
+        )
+
+    async def _recover_stream_turn_once(self, turn_anchor, stream_result):
+        """One-shot projection recovery; never polls or retries."""
+        from .turn_anchor import TurnReconciliationError
+
+        conv_id = stream_result.conversation_id or self._current_conv_id or ""
+        if not conv_id:
+            try:
+                conv_id = await self._conversation_id_from_url()
+            except Exception:
+                conv_id = ""
+        if not conv_id:
+            raise TurnReconciliationError(
+                conversation_id="",
+                anchor_mode=turn_anchor.mode,
+                last_status=stream_result.verdict,
+                diagnostic={"stream": stream_result.diagnostic},
+            )
+
+        result = await self._fetch_text_for_turn(conv_id, turn_anchor)
+        if result.status == "matched" and result.text is not None:
+            self._current_conv_id = conv_id
+            return result.text
+        if result.status == "non_text":
+            self._current_conv_id = conv_id
+            return (
+                "[Non-text response generated (image/tool-use/etc.) — "
+                "use get_conversation to retrieve full content.]"
+            )
+        raise TurnReconciliationError(
+            conversation_id=conv_id,
+            anchor_mode=turn_anchor.mode,
+            last_status=result.status,
+            diagnostic={
+                "stream": stream_result.diagnostic,
+                "last_fetch_diagnostic": result.diagnostic or {},
+            },
+        )
+
     async def send_and_stream(
         self,
         text: str,
@@ -1947,20 +2103,31 @@ class CDPDriver:
 
         # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
-        # §14: per-turn projection 指标从本 send 开始重新计数。
+        # Per-turn observability starts before any send-side work.
         self._reset_projection_stats()
-        # A1: count existing assistants BEFORE sending (fail-closed baseline).
+        self._reset_stream_primary_stats()
+        # Keep the baseline for the legacy compatibility path and send-ack
+        # fallback. This is a bounded pre-send DOM read, not completion polling.
         initial_count = await self._read_assistant_count_baseline()
 
-        # A2 Step 2: identity-listener health check.
         capture_scope = None
         if self._identity_listener is not None:
             await self._identity_listener.reenable_if_stale()
 
-        # A2 Step 3+4: arm capture scope + build fallback anchor.
-        # The fallback anchor captures pre-send state (backend node-ids/times
-        # or wall-clock) for dual-anchor correlation if UUID capture fails.
-        fallback_anchor = await self._capture_pre_send_fallback_anchor(text)
+        use_stream_primary = (
+            self._stream_primary_available
+            and self._turn_stream_runtime is not None
+        )
+        stream_context = (
+            self._turn_stream_runtime.begin_turn() if use_stream_primary else None
+        )
+        # Crucial: normal stream-primary sends must not do a pre-send backend
+        # projection GET merely to prepare an unused fallback.
+        fallback_anchor = (
+            self._capture_projection_free_fallback_anchor(text)
+            if use_stream_primary
+            else await self._capture_pre_send_fallback_anchor(text)
+        )
         if self._identity_listener is not None and self._identity_listener.is_alive():
             capture_scope = self._identity_listener.arm_capture_scope(
                 expected_text_hash=hash_sent_text(text),
@@ -2013,7 +2180,62 @@ class CDPDriver:
             # A2 Step 7: build the final anchor (fallback + captured UUID).
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
 
-            # A2 Step 8: stream + completion with the anchored turn.
+            # Production textual fast path: current-turn UUID from the
+            # IdentityListener is authoritative; completion/content come from
+            # the browser's own response stream. No DOM/projection polling.
+            if use_stream_primary and captured_uuid and stream_context is not None:
+                self._stream_primary_stats["expected_user_id"] = captured_uuid
+                stream_result = await self._turn_stream_runtime.wait_for_turn(
+                    captured_uuid, timeout=timeout, context=stream_context
+                )
+                diag = stream_result.diagnostic or {}
+                attempts = diag.get("attempts") or []
+                self._stream_primary_stats.update(
+                    {
+                        "winning_attempt": stream_result.attempt_id,
+                        "attempt_count": diag.get("attempt_count", 0),
+                        "retry_count": diag.get("retry_count", 0),
+                        "outcome": stream_result.verdict,
+                        "protocol_drift": any(
+                            bool(a.get("protocol_drift")) for a in attempts
+                        ),
+                        "raw_bytes_retained": diag.get("raw_bytes_retained", 0),
+                        "stream_bytes_seen": sum(
+                            int(a.get("bytes_seen") or 0) for a in attempts
+                        ),
+                    }
+                )
+                if stream_result.matched:
+                    self._stream_primary_stats["completion_source"] = "stream"
+                    if stream_result.conversation_id:
+                        self._current_conv_id = stream_result.conversation_id
+                    if stream_result.assistant_text:
+                        yield StreamChunk(delta=stream_result.assistant_text)
+                    yield StreamChunk(delta="", finish_reason="stop")
+                    return
+
+                # A stream failure never falls into the old polling loop.
+                # Recovery is exactly one anchored projection read.
+                self._stream_primary_stats["recovery_used"] = True
+                recovered = await self._recover_stream_turn_once(
+                    turn_anchor, stream_result
+                )
+                self._stream_primary_stats["completion_source"] = "stream_recovery"
+                if recovered:
+                    yield StreamChunk(delta=recovered)
+                yield StreamChunk(delta="", finish_reason="stop")
+                return
+
+            if use_stream_primary:
+                # Missing UUID means the authoritative current-turn identity
+                # was unavailable. Preserve the legacy compatibility path;
+                # its anchor was captured without a pre-send projection GET.
+                self._stream_primary_stats["completion_source"] = "legacy"
+                self._stream_primary_stats["outcome"] = "missing_user_anchor"
+            else:
+                self._stream_primary_stats["completion_source"] = "legacy"
+
+            # A2 Step 8: legacy stream + completion with the anchored turn.
             # P1: pass budgets + model for the model-aware two-state phase-2
             # machine. When None (no config available), the detector uses the
             # legacy single PHASE_STALL_SECONDS behavior.
@@ -2340,6 +2562,8 @@ class CDPDriver:
     # ── Lifecycle ─────────────────────────────────────────────
 
     async def close(self) -> None:
+        if self._turn_stream_runtime is not None:
+            await self._turn_stream_runtime.stop()
         # Stop the background reader first
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()

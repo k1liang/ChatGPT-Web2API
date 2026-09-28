@@ -665,6 +665,21 @@ class TurnSelection:
         return self.verdict == "matched"
 
 
+@dataclass
+class TurnParserCandidate:
+    """裁决候选：一个已（增量或全量）解析的 attempt。
+
+    ``parser`` 可以是刚刚从 raw bytes 全量喂出来的（离线裁决），也可以是
+    production runtime 里边收 chunk 边 feed 的同一个实例——裁决规则只有
+    一份，不依赖 raw bytes 是否还在。
+    """
+
+    attempt_id: str | None
+    parser: SendStreamParser
+    request_user_message_id: str | None = None
+    attempt: object | None = None
+
+
 def _attempt_anchor(attempt) -> str | None:
     """attempt 自身的 user message id 锚点：优先页面侧直接提取的字段，
     退回解析 request body（旧 capture 没有该字段）。"""
@@ -674,15 +689,15 @@ def _attempt_anchor(attempt) -> str | None:
     return user_message_id_from_request_body(getattr(attempt, "request_body", None))
 
 
-def select_turn_attempt(
-    attempts: list, *, expected_user_message_id: str | None = None
+def select_from_parser_candidates(
+    candidates: list, *, expected_user_message_id: str | None = None
 ) -> TurnSelection:
-    """从多个 page attempt 里裁决 logical turn 的结果（多 POST 正常路径）。
+    """在已解析的候选里裁决 logical turn（裁决规则的唯一实现）。
 
-    裁决规则（评审 P1：correlation 必须是**裁决实现**，不是实验结论）：
+    规则（评审 P1：correlation 必须是**裁决实现**，不是实验结论）：
 
-    1. 每个 attempt 独立解析；候选 = ``parser.is_terminal``（fail-close
-       条件已排除截断/漂移的 attempt）；
+    1. 候选 = ``parser.is_terminal``（fail-close 条件已排除截断/漂移/
+       丢帧/orphan 的 attempt）；
     2. 候选必须**精确匹配** user message id 锚点：
        - 流内 ``input_message``(role=user) 的 id 为 ``in_band``；
        - 调用方给的 ``expected_user_message_id``（Harness 侧已知的当前
@@ -700,21 +715,14 @@ def select_turn_attempt(
     """
     rows: list[dict] = []
     rejected: list[dict] = []
-    winner: tuple[object, SendStreamParser] | None = None
-    for attempt in attempts:
-        parser = SendStreamParser(content_type=getattr(attempt, "content_type", None))
-        if parser.is_event_stream:
-            parser.feed(getattr(attempt, "raw_bytes")())
-            if getattr(attempt, "error", None):
-                parser.mark_error(str(attempt.error))
-            elif getattr(attempt, "eof", False):
-                parser.mark_eof()
-        aid = getattr(attempt, "attempt_id", None)
-        rows.append({"attempt_id": aid, **parser.summary()})
+    winner: TurnParserCandidate | None = None
+    for cand in candidates:
+        parser = cand.parser
+        rows.append({"attempt_id": cand.attempt_id, **parser.summary()})
         if not parser.is_event_stream or not parser.is_terminal:
             continue
         in_band = parser.user_message_id
-        request_id = _attempt_anchor(attempt)
+        request_id = cand.request_user_message_id
         reason = None
         if in_band is None:
             reason = "no_user_anchor"
@@ -727,7 +735,7 @@ def select_turn_attempt(
         if reason is not None:
             rejected.append(
                 {
-                    "attempt_id": aid,
+                    "attempt_id": cand.attempt_id,
                     "reason": reason,
                     "in_band_user_message_id": in_band,
                     "request_user_message_id": request_id,
@@ -735,13 +743,13 @@ def select_turn_attempt(
                 }
             )
             continue
-        winner = (attempt, parser)
+        winner = cand
 
     if winner is not None:
         return TurnSelection(
             verdict="matched",
-            attempt=winner[0],
-            parser=winner[1],
+            attempt=winner.attempt,
+            parser=winner.parser,
             expected_user_message_id=expected_user_message_id,
             rows=rows,
             rejected=rejected,
@@ -758,6 +766,37 @@ def select_turn_attempt(
         expected_user_message_id=expected_user_message_id,
         rows=rows,
         rejected=rejected,
+    )
+
+
+def select_turn_attempt(
+    attempts: list, *, expected_user_message_id: str | None = None
+) -> TurnSelection:
+    """从多个 page attempt（raw capture 形态）裁决 logical turn 的结果。
+
+    离线/实验入口：把每个 attempt 的原始字节全量喂给 parser 后走
+    :func:`select_from_parser_candidates`（裁决逻辑只有一份）。production
+    runtime 增量喂同一 parser 实例后也走同一入口，不重新实现规则。
+    """
+    candidates = []
+    for attempt in attempts:
+        parser = SendStreamParser(content_type=getattr(attempt, "content_type", None))
+        if parser.is_event_stream:
+            parser.feed(getattr(attempt, "raw_bytes")())
+            if getattr(attempt, "error", None):
+                parser.mark_error(str(attempt.error))
+            elif getattr(attempt, "eof", False):
+                parser.mark_eof()
+        candidates.append(
+            TurnParserCandidate(
+                attempt_id=getattr(attempt, "attempt_id", None),
+                parser=parser,
+                request_user_message_id=_attempt_anchor(attempt),
+                attempt=attempt,
+            )
+        )
+    return select_from_parser_candidates(
+        candidates, expected_user_message_id=expected_user_message_id
     )
 
 

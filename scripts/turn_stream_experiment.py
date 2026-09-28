@@ -124,6 +124,7 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
     # EOF，供离线判定它到底是 SSE / JSONL / 自定义 framing。
     page_attempt_objs = d.take_page_stream_attempts()
     page_attempts = [a.to_dict(include_bytes=True) for a in page_attempt_objs]
+    production_stream_stats = d.stream_primary_stats
     # Commit B: 增量 parser 对每个主流 attempt 出结构化结论——
     # 「产生 terminal 的 attempt」即 logical turn 裁决（A2.4），并与
     # production 通道（send_and_stream）拿到的文本做交叉校验。
@@ -165,6 +166,7 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
         "network_stats": d.turn_network_stats,
         "fetch_stats": d.fetch_stream_stats,
         "page_stream_stats": d.page_stream_stats,
+        "production_stream_stats": production_stream_stats,
         "network_observations": observations,
         "fetch_observations": fetch_observations,
         "page_attempts": page_attempts,
@@ -273,6 +275,7 @@ def summarize(all_runs: list[dict]) -> dict:
             fobs = turn.get("fetch_observations") or []
             fcaptured = [o for o in fobs if o["outcome"] == "captured"]
             foutcomes = [o["outcome"] for o in fobs]
+            ps = turn.get("production_stream_stats") or {}
             rows.append(
                 {
                     "scenario": run["scenario"],
@@ -283,6 +286,18 @@ def summarize(all_runs: list[dict]) -> dict:
                     "error": turn["error"],
                     "projection_gets": turn["projection_stats"].get("count", 0),
                     "projection_429s": turn["projection_stats"].get("count429", 0),
+                    "completion_source": ps.get("completion_source"),
+                    "primary_outcome": ps.get("outcome"),
+                    "primary_expected_user_id": ps.get("expected_user_id"),
+                    "primary_winning_attempt": ps.get("winning_attempt"),
+                    "primary_attempt_count": ps.get("attempt_count", 0),
+                    "primary_retry_count": ps.get("retry_count", 0),
+                    "primary_recovery_used": bool(ps.get("recovery_used")),
+                    "primary_protocol_drift": bool(ps.get("protocol_drift")),
+                    "primary_dom_polls": ps.get("dom_poll_count", 0),
+                    "primary_completion_polls": ps.get("completion_poll_count", 0),
+                    "primary_raw_bytes_retained": ps.get("raw_bytes_retained", 0),
+                    "primary_stream_bytes_seen": ps.get("stream_bytes_seen", 0),
                     "capture_outcomes": outcomes,
                     "captured_body_size": max(
                         (o["body_size"] or 0) for o in captured
@@ -338,6 +353,121 @@ def summarize(all_runs: list[dict]) -> dict:
                 }
             )
     return {"turns": rows}
+
+
+def evaluate_production_gate(all_runs: list[dict]) -> dict:
+    """Hard acceptance gate for the production textual stream-primary path."""
+    failures: list[dict] = []
+    rows: list[dict] = []
+    seen_ids: dict[tuple[str, int], list[str]] = {}
+
+    def fail(run: dict, turn: dict, reason: str, detail=None) -> None:
+        failures.append(
+            {
+                "scenario": run.get("scenario"),
+                "repeat": run.get("repeat"),
+                "turn": turn.get("turn_index"),
+                "reason": reason,
+                "detail": detail,
+            }
+        )
+
+    for run in all_runs:
+        sid = run.get("scenario")
+        repeat = run.get("repeat")
+        ids: list[str] = []
+        for turn in run.get("turns") or []:
+            ps = turn.get("production_stream_stats") or {}
+            output = turn.get("streamed_text") or ""
+            expected_id = ps.get("expected_user_id")
+            if isinstance(expected_id, str) and expected_id:
+                ids.append(expected_id)
+            row = {
+                "scenario": sid,
+                "repeat": repeat,
+                "turn": turn.get("turn_index"),
+                "completion_source": ps.get("completion_source"),
+                "outcome": ps.get("outcome"),
+                "expected_user_id": expected_id,
+                "winning_attempt": ps.get("winning_attempt"),
+                "attempt_count": ps.get("attempt_count", 0),
+                "retry_count": ps.get("retry_count", 0),
+                "recovery_used": bool(ps.get("recovery_used")),
+                "protocol_drift": bool(ps.get("protocol_drift")),
+                "projection_gets": turn.get("projection_stats", {}).get("count", 0),
+                "projection_429s": turn.get("projection_stats", {}).get("count429", 0),
+                "dom_polls": ps.get("dom_poll_count", 0),
+                "completion_polls": ps.get("completion_poll_count", 0),
+                "raw_bytes_retained": ps.get("raw_bytes_retained", 0),
+                "stream_bytes_seen": ps.get("stream_bytes_seen", 0),
+                "wall_ms": turn.get("wall_ms"),
+                "error": turn.get("error"),
+                "output_len": len(output),
+            }
+            rows.append(row)
+
+            checks = [
+                (turn.get("error") is None, "turn_error", turn.get("error")),
+                (ps.get("completion_source") == "stream", "completion_source", ps.get("completion_source")),
+                (ps.get("outcome") == "matched", "stream_outcome", ps.get("outcome")),
+                (bool(expected_id), "missing_expected_user_id", expected_id),
+                ((ps.get("attempt_count") or 0) >= 1, "missing_stream_attempt", ps.get("attempt_count")),
+                (not ps.get("recovery_used"), "recovery_used", True),
+                (not ps.get("protocol_drift"), "protocol_drift", True),
+                ((ps.get("dom_poll_count") or 0) == 0, "dom_polling", ps.get("dom_poll_count")),
+                ((ps.get("completion_poll_count") or 0) == 0, "completion_polling", ps.get("completion_poll_count")),
+                ((ps.get("raw_bytes_retained") or 0) == 0, "raw_bytes_retained", ps.get("raw_bytes_retained")),
+                ((turn.get("projection_stats", {}).get("count", 0)) == 0, "projection_get", turn.get("projection_stats", {}).get("count", 0)),
+                ((turn.get("projection_stats", {}).get("count429", 0)) == 0, "projection_429", turn.get("projection_stats", {}).get("count429", 0)),
+            ]
+            for ok, reason, detail in checks:
+                if not ok:
+                    fail(run, turn, reason, detail)
+
+            ti = turn.get("turn_index")
+            if sid == "S1" and "MARKER-S1-1" not in output:
+                fail(run, turn, "wrong_S1_output", output[:160])
+            elif sid == "S7" and "MARKER-S7-1" not in output:
+                fail(run, turn, "wrong_S7_output", output[:160])
+            elif sid == "S5":
+                expected = f"MARKER-S5-{int(ti) + 1}"
+                if expected not in output:
+                    fail(run, turn, "wrong_S5_output", output[:160])
+            elif sid == "S6":
+                if not output.strip():
+                    fail(run, turn, "empty_S6_output", None)
+                elif int(ti) == 1 and "Kai" not in output:
+                    fail(run, turn, "wrong_S6_memory_output", output[:160])
+            elif sid == "S4":
+                try:
+                    obj = json.loads(output.strip())
+                except Exception as e:
+                    fail(run, turn, "invalid_S4_json", str(e))
+                else:
+                    if obj != {"sum": 40, "product": 391}:
+                        fail(run, turn, "wrong_S4_json", obj)
+            elif sid in ("S2", "S3") and not output.strip():
+                fail(run, turn, f"empty_{sid}_output", None)
+
+        seen_ids[(str(sid), int(repeat))] = ids
+        if len(ids) != len(set(ids)):
+            failures.append(
+                {
+                    "scenario": sid,
+                    "repeat": repeat,
+                    "turn": None,
+                    "reason": "duplicate_turn_user_id",
+                    "detail": ids,
+                }
+            )
+
+    return {
+        "pass": not failures,
+        "turn_count": len(rows),
+        "failure_count": len(failures),
+        "failures": failures,
+        "turns": rows,
+    }
 
 
 def write_markdown(summary: dict, path: str) -> None:
@@ -477,9 +607,9 @@ def prefix_check_run_dir(run_dir: str) -> int:
     message 的正文（echo assistant 没有 stream ops，不会成为 candidate）。
     每个 chunk 边界取一次 candidate，最后统一对照终态 assistant_text。
     """
-    from chatgpt_web2api.response_stream import SendStreamParser
-
     import base64
+
+    from chatgpt_web2api.response_stream import SendStreamParser
 
     def candidate_text(p: SendStreamParser) -> str:
         for mid in reversed(p._order):
@@ -558,9 +688,6 @@ def replay_run_dir(run_dir: str) -> int:
     summary——原始 summary 是「当时的 parser 说了什么」的历史记录），
     并附 parser 指纹与新旧裁决差异。
     """
-    import glob
-    import re
-
     run_files, skipped = _collect_run_files(run_dir)
     if not run_files:
         print(f"REFUSED: no run files (<sid>_r<k>.json) in {run_dir}")
@@ -704,11 +831,16 @@ async def main() -> int:
     )
     parser.add_argument(
         "--capture",
-        choices=["network", "fetch", "page", "both"],
+        choices=["none", "network", "fetch", "page", "both"],
         default="page",
-        help="捕获通道：page=页面内 fetch tee（Method E，矩阵 AMENDMENT 2）；"
-        "network=Network.getResponseBody（已被否证）；fetch=Fetch 域取流"
-        "（已被否证，会卡页面）；both=network+page",
+        help="捕获通道：none=production stream-primary（不保留 raw bytes）；"
+        "page=页面内 fetch tee + raw 诊断；network=Network.getResponseBody"
+        "（已被否证）；fetch=Fetch 域取流（已被否证，会卡页面）；both=network+page",
+    )
+    parser.add_argument(
+        "--production-gate",
+        action="store_true",
+        help="按 production textual stream-primary 硬门禁验收本次 live matrix",
     )
     parser.add_argument(
         "--replay",
@@ -753,6 +885,13 @@ async def main() -> int:
         scenario_ids = requested
     elif not args.pilots and not args.full:
         parser.error("one of --pilots / --full / --scenarios is required")
+    if args.production_gate:
+        if args.capture != "none":
+            print("REFUSED: --production-gate requires --capture none")
+            return 2
+        if "S8" in scenario_ids:
+            print("REFUSED: S8 non-text is outside the textual production gate")
+            return 2
     repeats = max(1, int(args.repeats))
     run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(OUTPUT_ROOT, run_id)
@@ -815,10 +954,24 @@ async def main() -> int:
     print(f"[experiment] output: {out_dir}")
     for r in summary["turns"]:
         print(
-            "{scenario} t{turn}: projGET={projection_gets} 429={projection_429s} "
-            "page(attempts={page_attempts} chunks={page_chunks} bytes={page_bytes} "
-            "eofs={page_eofs}) err={error}".format(**r)
+            "{scenario} r{repeat} t{turn}: source={completion_source} "
+            "outcome={primary_outcome} attempts={primary_attempt_count} "
+            "recovery={primary_recovery_used} projGET={projection_gets} "
+            "raw={primary_raw_bytes_retained} err={error}".format(**r)
         )
+
+    if args.production_gate:
+        gate = evaluate_production_gate(all_runs)
+        gate_path = os.path.join(out_dir, "production-gate.json")
+        with open(gate_path, "w", encoding="utf-8") as f:
+            json.dump(gate, f, ensure_ascii=False, indent=2)
+        print(
+            f"[production-gate] pass={gate['pass']} turns={gate['turn_count']} "
+            f"failures={gate['failure_count']} artifact={gate_path}"
+        )
+        for failure in gate["failures"][:20]:
+            print(f"[production-gate] FAIL {failure}")
+        return 0 if gate["pass"] else 1
     return 0
 
 

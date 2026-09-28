@@ -183,3 +183,48 @@ def test_replay_never_imports_cdp_runtime(run_dir):
         timeout=120,
     )
     assert proc.returncode == 0, proc.stderr
+
+
+def _production_run(*, projection_gets: int = 0, recovery: bool = False) -> dict:
+    turn = _turn_dict()
+    turn["streamed_text"] = ASSISTANT_TEXT
+    turn["projection_stats"] = {"count": projection_gets, "count429": 0}
+    turn["production_stream_stats"] = {
+        "completion_source": "stream_recovery" if recovery else "stream",
+        "outcome": "matched",
+        "expected_user_id": "u-1",
+        "winning_attempt": "a1",
+        "attempt_count": 1,
+        "retry_count": 0,
+        "recovery_used": recovery,
+        "protocol_drift": False,
+        "dom_poll_count": 0,
+        "completion_poll_count": 0,
+        "raw_bytes_retained": 0,
+        "stream_bytes_seen": 123,
+    }
+    return {"scenario": "S1", "repeat": 1, "turns": [turn]}
+
+
+def test_production_gate_accepts_zero_polling_stream_primary():
+    mod = _load_module()
+    gate = mod.evaluate_production_gate([_production_run()])
+
+    assert gate["pass"] is True
+    assert gate["turn_count"] == 1
+    assert gate["failure_count"] == 0
+    assert gate["turns"][0]["completion_source"] == "stream"
+    assert gate["turns"][0]["projection_gets"] == 0
+
+
+def test_production_gate_rejects_recovery_and_projection():
+    mod = _load_module()
+    gate = mod.evaluate_production_gate(
+        [_production_run(projection_gets=1, recovery=True)]
+    )
+
+    assert gate["pass"] is False
+    reasons = {f["reason"] for f in gate["failures"]}
+    assert "completion_source" in reasons
+    assert "recovery_used" in reasons
+    assert "projection_get" in reasons
