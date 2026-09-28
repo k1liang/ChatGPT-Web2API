@@ -21,7 +21,12 @@ import base64
 import json
 from pathlib import Path
 
-from chatgpt_web2api.response_stream import SendStreamParser, pick_turn_attempt
+from chatgpt_web2api.response_stream import (
+    SendStreamParser,
+    pick_turn_attempt,
+    select_turn_attempt,
+    user_message_id_from_request_body,
+)
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "response_stream"
 
@@ -33,15 +38,23 @@ def load_fixture_chunks(name: str) -> tuple[str, list[bytes]]:
 
 
 class FakeAttempt:
-    """page_stream_hook.StreamAttempt 的最小替身（pick_turn_attempt 用）。"""
+    """page_stream_hook.StreamAttempt 的最小替身（裁决用）。
+
+    ``request_body`` / ``request_user_message_id`` 是 turn 归属锚点的两个
+    来源（后者为页面侧提取，旧 capture 没有，退回解析 body）。
+    """
 
     def __init__(self, attempt_id: str, content_type: str, raw: bytes,
-                 *, eof: bool = False, error: str | None = None):
+                 *, eof: bool = False, error: str | None = None,
+                 request_body: str | None = None,
+                 request_user_message_id: str | None = None):
         self.attempt_id = attempt_id
         self.content_type = content_type
         self._raw = raw
         self.eof = eof
         self.error = error
+        self.request_body = request_body
+        self.request_user_message_id = request_user_message_id
 
     def raw_bytes(self) -> bytes:
         return self._raw
@@ -49,6 +62,67 @@ class FakeAttempt:
 
 def sse(*payloads: str) -> bytes:
     return "".join(f"data: {p}\n\n" for p in payloads).encode("utf-8")
+
+
+def req_body(user_id: str, text: str = "hi") -> str:
+    """真实 capture 形态的 send POST request body（S5 实测）。"""
+    return json.dumps(
+        {
+            "action": "next",
+            "messages": [
+                {
+                    "id": user_id,
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": [text]},
+                }
+            ],
+            "model": "auto",
+        }
+    )
+
+
+def add_message(msg_id: str, role: str, parts: list[str], **fields) -> str:
+    """一条 add 帧的 payload（与真实帧同形，测试构造用）。"""
+    msg = {
+        "id": msg_id,
+        "author": {"role": role},
+        "content": {"content_type": "text", "parts": parts},
+    }
+    msg.update(fields)
+    return json.dumps({"v": {"message": msg}})
+
+
+def terminal_patch(text: str) -> str:
+    """终态 batch patch：正文 append + status + end_turn。"""
+    return json.dumps(
+        {
+            "o": "patch",
+            "v": [
+                {"p": "/message/content/parts/0", "o": "append", "v": text},
+                {"p": "/message/status", "o": "replace", "v": "finished_successfully"},
+                {"p": "/message/end_turn", "o": "replace", "v": True},
+            ],
+        }
+    )
+
+
+def input_message(user_id: str) -> str:
+    return json.dumps(
+        {"type": "input_message", "input_message": {"id": user_id,
+                                                    "author": {"role": "user"}}}
+    )
+
+
+def turn_stream(user_id: str, text: str, *, assistant_id: str = "m-asst",
+                conv: str = "c") -> bytes:
+    """一个完整的、能到终态的最小主流。"""
+    return sse(
+        input_message(user_id),
+        add_message(assistant_id, "assistant", [""], status="in_progress"),
+        terminal_patch(text),
+        json.dumps({"type": "message_stream_complete", "conversation_id": conv}),
+        "[DONE]",
+    )
 
 
 def parse_all(content_type: str, chunks: list[bytes], *, error: str | None = None,
@@ -375,6 +449,147 @@ def test_truncated_json_object_counts_invalid():
     assert "m" in json.dumps(p.summary())
 
 
+# ── fail-close：截断与协议漂移（评审 P1）────────────────────
+
+
+def test_text_overflow_fails_closed(monkeypatch):
+    """终态 assistant 正文被截断 → 绝不 matched（截断结果比失败更危险）。"""
+    from chatgpt_web2api import response_stream as rs
+
+    monkeypatch.setattr(rs, "_MAX_TEXT_PER_MESSAGE", 10)
+    stream = sse(
+        '{"type":"input_message","input_message":{"id":"u-1","author":{"role":"user"}}}',
+        '{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+        '"status":"in_progress","content":{"parts":[""]}}}}',
+        '{"c":1,"p":"/message/content/parts/0","o":"append","v":"AAAAAAAAAA"}',
+        '{"c":2,"p":"/message/content/parts/0","o":"append","v":"BBBBBBBBBB"}',
+        '{"c":3,"o":"patch","v":[{"p":"/message/status","o":"replace",'
+        '"v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}',
+        '{"type":"message_stream_complete","conversation_id":"c"}',
+        "[DONE]",
+    )
+    p = parse_all("text/event-stream", [stream])
+    assert p.assistant_terminal  # 三条件确实满足
+    assert p.text_overflow
+    assert not p.is_terminal  # 但 fail-close
+    assert p.outcome() == "text_overflow"
+    assert p.assistant_text == "A" * 10
+    # 裁决同样不得接受它（不能靠调用方自觉）。
+    attempt = FakeAttempt("a1", "text/event-stream", stream, eof=True,
+                          request_body=req_body("u-1"))
+    assert pick_turn_attempt([attempt], expected_user_message_id="u-1") == (None, None)
+
+
+def test_truncated_echo_message_does_not_fail_the_turn(monkeypatch):
+    """回声消息的正文被上界截断不算失败——只有终态 assistant 的截断才 fail-close。"""
+    from chatgpt_web2api import response_stream as rs
+
+    monkeypatch.setattr(rs, "_MAX_TEXT_PER_MESSAGE", 10)
+    stream = sse(
+        '{"c":0,"v":{"message":{"id":"echo","author":{"role":"assistant"},'
+        '"status":"finished_successfully","content":{"parts":["%s"]}}}}' % ("E" * 30),
+        '{"type":"input_message","input_message":{"id":"u-1","author":{"role":"user"}}}',
+        '{"c":1,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+        '"status":"in_progress","content":{"parts":[""]}}}}',
+        '{"c":2,"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":"答案"},'
+        '{"p":"/message/status","o":"replace","v":"finished_successfully"},'
+        '{"p":"/message/end_turn","o":"replace","v":true}]}',
+        '{"type":"message_stream_complete","conversation_id":"c"}',
+        "[DONE]",
+    )
+    p = parse_all("text/event-stream", [stream])
+    assert p.truncated_message_count == 1  # 回声被截断（只计数）
+    assert not p.text_overflow
+    assert p.outcome() == "matched"
+    assert p.assistant_text == "答案"
+
+
+def test_initial_parts_are_capped_and_released(monkeypatch):
+    """初始 content.parts 也受正文上界约束，且不再是最新 target 后立即释放。"""
+    from chatgpt_web2api import response_stream as rs
+
+    monkeypatch.setattr(rs, "_MAX_TEXT_PER_MESSAGE", 16)
+    p = SendStreamParser(content_type="text/event-stream")
+    p.feed(sse(add_message("e1", "user", ["Z" * 100], status="finished_successfully")))
+    assert p.truncated_message_count == 1
+    assert p.retained_text_chars() == 16
+    p.feed(sse(add_message("e2", "user", ["Y" * 100], status="finished_successfully")))
+    # e1 不再是 target：正文释放；常驻只剩最新 target。
+    assert p.released_message_count == 1
+    assert p.retained_text_chars() == 16
+
+
+def test_retained_text_is_bounded_under_many_large_echoes():
+    """回声消息带整段历史正文时，常驻内存不随消息数线性增长（评审 P1）。"""
+    p = SendStreamParser(content_type="text/event-stream")
+    big = "x" * 200_000
+    for i in range(30):
+        p.feed(sse(add_message(f"e{i}", "user", [big], status="finished_successfully")))
+    assert p.released_message_count == 29
+    assert p.retained_text_chars() <= 2 * len(big)  # 只有最新 target 的正文
+    assert p.summary()["message_count"] == 30  # 元数据仍在（状态机需要）
+
+
+def test_line_buffer_overflow_is_counted_and_dropped(monkeypatch):
+    from chatgpt_web2api import response_stream as rs
+
+    monkeypatch.setattr(rs, "_MAX_LINE_CHARS", 100)
+    p = SendStreamParser(content_type="text/event-stream")
+    p.feed(b"data: " + b"A" * 500)  # 没有换行的超长行
+    assert p.line_overflow_count == 1
+    assert len(p._pending) == 0  # 缓冲不增长
+
+
+def test_delta_frame_requires_the_delta_event_name():
+    """形态 5 必须 ``event: delta``：否则未来带字符串 v 的事件会被误拼进正文。
+
+    真实帧 100% 带该事件名（S1/S3/S7 共 218 个文本帧，零例外）。
+    """
+    stream = (
+        sse('{"type":"input_message","input_message":{"id":"u-1",'
+            '"author":{"role":"user"}}}')
+        + sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+              '"status":"in_progress","content":{"parts":[""]}}}}')
+        # 没有 event: delta 的文本帧（协议漂移信号）。
+        + sse('{"v":"这段正文没有 event: delta"}')
+        # 带 event: delta 的文本帧（真实形态）。
+        + b"event: delta\n" + sse('{"v":"这段有"}')
+        + sse('{"c":1,"o":"patch","v":[{"p":"/message/content/parts/0",'
+              '"o":"append","v":"，保留"},{"p":"/message/status","o":"replace",'
+              '"v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}')
+        + sse('{"type":"message_stream_complete","conversation_id":"c"}')
+        + sse("[DONE]")
+    )
+    p = parse_all("text/event-stream", [stream])
+    assert "这段有" in p.assistant_text and "，保留" in p.assistant_text
+    assert "没有 event: delta" not in p.assistant_text
+    assert p.unrouted_delta_count == 1
+    assert p.delta_frame_count == 1
+    assert not p.is_terminal  # 正文可能已被丢弃 → fail-close
+    assert p.outcome() == "unrouted_delta"
+
+
+def test_diagnostics_collections_are_capped(monkeypatch):
+    from chatgpt_web2api import response_stream as rs
+
+    monkeypatch.setattr(rs, "_MAX_EVENT_TYPES", 2)
+    monkeypatch.setattr(rs, "_MAX_TERMINAL_IDS", 2)
+    p = SendStreamParser(content_type="text/event-stream")
+    for t in ("t1", "t2", "t3", "t4"):
+        p.feed(sse(json.dumps({"type": t})))
+    assert len(p.event_types_seen) == 2
+    for i in range(4):
+        p.feed(
+            sse(
+                add_message(
+                    f"m{i}", "assistant", [str(i)],
+                    status="finished_successfully", end_turn=True,
+                )
+            )
+        )
+    assert p.terminal_assistant_ids == ["m2", "m3"]
+
+
 # ── token 卫生 ─────────────────────────────────────────────
 
 
@@ -403,19 +618,15 @@ def test_pick_turn_attempt_prefers_terminal_attempt():
         sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
             '"status":"in_progress","content":{"parts":[""]}}}}'),
         error="AbortError: BodyStreamBuffer was aborted",
+        request_body=req_body("u-1"),
     )
     ok = FakeAttempt(
         "a2", "text/event-stream",
-        sse('{"c":0,"v":{"message":{"id":"m2","author":{"role":"assistant"},'
-            '"status":"in_progress","content":{"parts":[""]}}}}',
-            '{"c":1,"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":"hi"},'
-            '{"p":"/message/status","o":"replace","v":"finished_successfully"},'
-            '{"p":"/message/end_turn","o":"replace","v":true}]}',
-            '{"type":"message_stream_complete","conversation_id":"c"}',
-            "[DONE]"),
+        turn_stream("u-1", "hi", assistant_id="m2"),
         eof=False,  # 真实路径：终态后被 abort，没有 EOF
+        request_body=req_body("u-1"),
     )
-    attempt, parser = pick_turn_attempt([aborted, ok])
+    attempt, parser = pick_turn_attempt([aborted, ok], expected_user_message_id="u-1")
     assert attempt is not None and attempt.attempt_id == "a2"
     assert parser is not None and parser.outcome() == "matched"
     assert parser.assistant_text == "hi"
@@ -427,3 +638,150 @@ def test_pick_turn_attempt_returns_none_without_terminal():
     non_stream = FakeAttempt("a2", "application/json", b'{"status":"ok"}', eof=True)
     attempt, parser = pick_turn_attempt([aborted, non_stream])
     assert attempt is None and parser is None
+
+
+def test_selection_rejects_previous_turn_late_terminal():
+    """反例 1：旧 turn 的 terminal 掉进本轮缓存，当前 turn 只到 abort。
+
+    没有锚点精确匹配时，实现会把这个旧结果当成本轮答案——这正是评审
+    要求的「correlation 必须是裁决实现」。
+    """
+    stale = FakeAttempt(
+        "a-old", "text/event-stream", turn_stream("u-old", "旧回答"),
+        eof=True, request_body=req_body("u-old"),
+    )
+    current_aborted = FakeAttempt(
+        "a-cur", "text/event-stream",
+        sse('{"type":"input_message","input_message":{"id":"u-cur","author":{"role":"user"}}}',
+            '{"c":0,"v":{"message":{"id":"m-cur","author":{"role":"assistant"},'
+            '"status":"in_progress","content":{"parts":[""]}}}}'),
+        error="AbortError: BodyStreamBuffer was aborted",
+        request_body=req_body("u-cur"),
+    )
+    sel = select_turn_attempt([stale, current_aborted], expected_user_message_id="u-cur")
+    assert sel.verdict == "user_id_mismatch"
+    assert sel.attempt is None and sel.parser is None
+    assert sel.rejected[0]["attempt_id"] == "a-old"
+    assert sel.rejected[0]["in_band_user_message_id"] == "u-old"
+    assert sel.rejected[0]["expected_user_message_id"] == "u-cur"
+
+
+def test_selection_picks_the_attempt_matching_expected_user_id():
+    """反例 2：两个不同 user id 都到终态 —— 只认期望 id 的那一个。"""
+    first = FakeAttempt("a1", "text/event-stream", turn_stream("u-1", "答案一"),
+                        eof=True, request_body=req_body("u-1"))
+    second = FakeAttempt("a2", "text/event-stream", turn_stream("u-2", "答案二"),
+                         eof=True, request_body=req_body("u-2"))
+    sel1 = select_turn_attempt([first, second], expected_user_message_id="u-1")
+    assert sel1.verdict == "matched" and sel1.attempt.attempt_id == "a1"
+    assert sel1.parser.assistant_text == "答案一"
+    sel2 = select_turn_attempt([first, second], expected_user_message_id="u-2")
+    assert sel2.verdict == "matched" and sel2.attempt.attempt_id == "a2"
+    # 两个都不是期望的 id：宁可不给结果。
+    sel3 = select_turn_attempt([first, second], expected_user_message_id="u-9")
+    assert sel3.verdict == "user_id_mismatch" and sel3.attempt is None
+
+
+def test_selection_retry_order_does_not_steal_the_win():
+    """反例 3：到达顺序反转 —— 迟到的另一个 turn 的 terminal 不得抢走赢家。"""
+    ok = FakeAttempt("a-ok", "text/event-stream", turn_stream("u-1", "本轮答案"),
+                     eof=True, request_body=req_body("u-1"))
+    late_stale = FakeAttempt("a-late", "text/event-stream",
+                             turn_stream("u-2", "别人的答案"),
+                             eof=True, request_body=req_body("u-2"))
+    sel = select_turn_attempt([ok, late_stale], expected_user_message_id="u-1")
+    assert sel.verdict == "matched" and sel.attempt.attempt_id == "a-ok"
+    assert sel.parser.assistant_text == "本轮答案"
+    # 同一 turn 的 retry：后到的、id 相同的那个才是最终赢家。
+    retry = FakeAttempt("a-retry", "text/event-stream", turn_stream("u-1", "重试答案"),
+                        eof=False, request_body=req_body("u-1"))
+    sel2 = select_turn_attempt([ok, late_stale, retry], expected_user_message_id="u-1")
+    assert sel2.attempt.attempt_id == "a-retry"
+
+
+def test_selection_self_anchors_on_request_body_without_caller_anchor():
+    """调用方不给期望 id 时，用 attempt 自身 request body 的 user id 自校验。"""
+    ok = FakeAttempt("a1", "text/event-stream", turn_stream("u-1", "x"),
+                     eof=True, request_body=req_body("u-1"))
+    sel = select_turn_attempt([ok])
+    assert sel.verdict == "matched" and sel.attempt is ok
+
+    # 流内 user id 与 request body 的 user id 不一致：这条流不属于这条请求。
+    mismatch = FakeAttempt("a2", "text/event-stream", turn_stream("u-other", "x"),
+                           eof=True, request_body=req_body("u-1"))
+    sel2 = select_turn_attempt([mismatch])
+    assert sel2.verdict == "user_id_mismatch" and sel2.attempt is None
+
+    # 页面侧直接给的锚点字段优先于解析 body。
+    by_field = FakeAttempt("a3", "text/event-stream", turn_stream("u-7", "x"),
+                           eof=True, request_body=None,
+                           request_user_message_id="u-7")
+    assert select_turn_attempt([by_field]).verdict == "matched"
+
+
+def test_selection_fails_closed_without_any_anchor():
+    """没有任何锚点来源 = 无法归属 → 拒绝（不得退回「取最后一个 terminal」）。"""
+    no_anchor = FakeAttempt("a1", "text/event-stream", turn_stream("u-1", "x"), eof=True)
+    sel = select_turn_attempt([no_anchor])
+    assert sel.verdict == "no_user_anchor" and sel.attempt is None
+
+    no_in_band = FakeAttempt(
+        "a2", "text/event-stream",
+        sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+            '"status":"in_progress","content":{"parts":[""]}}}}',
+            '{"c":1,"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":"x"},'
+            '{"p":"/message/status","o":"replace","v":"finished_successfully"},'
+            '{"p":"/message/end_turn","o":"replace","v":true}]}',
+            '{"type":"message_stream_complete","conversation_id":"c"}',
+            "[DONE]"),
+        eof=True, request_body=req_body("u-1"),
+    )
+    sel2 = select_turn_attempt([no_in_band], expected_user_message_id="u-1")
+    assert sel2.verdict == "no_user_anchor" and sel2.attempt is None
+
+
+def test_selection_reports_no_terminal_and_no_stream():
+    aborted = FakeAttempt("a1", "text/event-stream",
+                          sse('{"type":"input_message","input_message":'
+                              '{"id":"u-1","author":{"role":"user"}}}'),
+                          error="AbortError: x", request_body=req_body("u-1"))
+    assert select_turn_attempt([aborted]).verdict == "no_terminal"
+    non_stream = FakeAttempt("a2", "application/json", b'{"status":"ok"}', eof=True)
+    assert select_turn_attempt([non_stream]).verdict == "no_stream"
+
+
+# ── turn 锚点来源（request body）────────────────────────────
+
+
+def test_user_message_id_from_request_body_real_shape():
+    """S5/S6 实测形态：messages 里最后一条 user 消息的 id。"""
+    body = json.dumps(
+        {
+            "action": "next",
+            "messages": [
+                {"id": "old-u", "author": {"role": "user"}, "content": {"parts": ["上轮"]}},
+                {"id": "a-1", "author": {"role": "assistant"}, "content": {"parts": ["答"]}},
+                {"id": "cur-u", "author": {"role": "user"}, "content": {"parts": ["本轮"]}},
+            ],
+        }
+    )
+    assert user_message_id_from_request_body(body) == "cur-u"
+
+
+def test_user_message_id_from_request_body_rejects_unusable_forms():
+    assert user_message_id_from_request_body(None) is None
+    assert user_message_id_from_request_body("") is None
+    assert user_message_id_from_request_body("<Blob>") is None
+    assert user_message_id_from_request_body("not json{") is None
+    # 被截断的 body（hook 的截断标记）：绝不做部分解析。
+    assert user_message_id_from_request_body('{"messages":[{"id":"u-1"' + "...<truncated>") is None
+    # prepare/finalize：有 partial_query 但没有 messages。
+    assert user_message_id_from_request_body('{"action":"next","partial_query":"hi"}') is None
+    # 只有 assistant 消息。
+    assert user_message_id_from_request_body(
+        '{"messages":[{"id":"a","author":{"role":"assistant"}}]}'
+    ) is None
+    # user 消息没有 id。
+    assert user_message_id_from_request_body(
+        '{"messages":[{"author":{"role":"user"}}]}'
+    ) is None
