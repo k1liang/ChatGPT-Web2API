@@ -35,13 +35,16 @@ import os
 import sys
 import time
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from chatgpt_web2api.cdp_driver import CDPDriver  # noqa: E402
-from chatgpt_web2api.chatgpt_dom import ASSISTANT_MESSAGE_SELECTOR  # noqa: E402
-from chatgpt_web2api.chrome import ChromeProcess  # noqa: E402
-from chatgpt_web2api.config import Config  # noqa: E402
+if TYPE_CHECKING:
+    # 仅供类型标注；运行时 import 放在 live 路径里——--replay 必须能在
+    # 只有 stdlib + response_stream 的环境跑（评审 P2：replay 不需要
+    # Chrome/CDP/portalocker，顶层 import 会把整套 runtime dependency
+    # closure 拖进来）。
+    from chatgpt_web2api.cdp_driver import CDPDriver
 
 # 输出根目录（工作计划硬规则：临时数据只进 .gaifan/temp/ 或 OS temp）。
 OUTPUT_ROOT = os.path.join(
@@ -97,6 +100,8 @@ SCENARIOS = {
 
 async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
     """发送一个 turn，回收 Method A 指标 + Phase A 观测。"""
+    from chatgpt_web2api.chatgpt_dom import ASSISTANT_MESSAGE_SELECTOR
+
     d._reset_projection_stats()
     t0 = time.monotonic()
     streamed_text = ""
@@ -396,6 +401,9 @@ def parser_fingerprint() -> dict:
         "parser_file": str(path),
         "parser_sha256_16": hashlib.sha256(path.read_bytes()).hexdigest()[:16],
         "repo_head": None,
+        # HEAD 只说明提交了什么；parser 文件可能来自 dirty worktree——
+        # 两者一起看才能确定结论出自哪份代码（评审 P2）。
+        "repo_dirty": None,
     }
     try:
         proc = subprocess.run(
@@ -406,6 +414,14 @@ def parser_fingerprint() -> dict:
             timeout=5,
         )
         fp["repo_head"] = proc.stdout.strip() or None
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=str(path.parent),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        fp["repo_dirty"] = bool(proc.stdout.strip())
     except Exception:
         pass
     return fp
@@ -420,14 +436,23 @@ def replay_run_dir(run_dir: str) -> int:
     并附 parser 指纹与新旧裁决差异。
     """
     import glob
+    import re
 
-    run_files = [
-        f
-        for f in sorted(glob.glob(os.path.join(run_dir, "*.json")))
-        if os.path.basename(f) not in ("summary.json", "replay-summary.json")
-    ]
+    # 输入 whitelist：原始 run 文件是 live 跑出的 <sid>_r<k>.json。**不能**
+    # 用 blacklist——replay 自己的产物（replay-attempts.json 等）落在同一
+    # 目录里，第二次 replay 会把自己的 artifact 当输入（评审 P1：replay
+    # 必须可重复执行）。whitelist 之外再校验内容形态，双保险。
+    run_file_re = re.compile(r"^.+_r\d+\.json$")
+    skipped: list[str] = []
+    run_files: list[str] = []
+    for f in sorted(glob.glob(os.path.join(run_dir, "*.json"))):
+        base = os.path.basename(f)
+        if not run_file_re.match(base):
+            skipped.append(base)
+            continue
+        run_files.append(f)
     if not run_files:
-        print(f"REFUSED: no run files in {run_dir}")
+        print(f"REFUSED: no run files (<sid>_r<k>.json) in {run_dir}")
         return 2
 
     runs = []
@@ -435,6 +460,16 @@ def replay_run_dir(run_dir: str) -> int:
     for f in run_files:
         with open(f, encoding="utf-8") as fh:
             run = json.load(fh)
+        # 内容形态校验：不是原始 run 文件（缺 scenario/repeat/turns）就跳过，
+        # 绝不让 replay artifact 混进输入。
+        if (
+            not isinstance(run, dict)
+            or not isinstance(run.get("scenario"), str)
+            or not isinstance(run.get("repeat"), int)
+            or not isinstance(run.get("turns"), list)
+        ):
+            skipped.append(os.path.basename(f))
+            continue
         for turn in run.get("turns") or []:
             attempts = [CapturedAttempt(a) for a in (turn.get("page_attempts") or [])]
             turn["stream_analysis"] = analyze_turn_stream(
@@ -485,7 +520,9 @@ def replay_run_dir(run_dir: str) -> int:
     _write_replay_diff(summary, old, os.path.join(run_dir, "replay-diff.md"))
 
     print(f"[replay] dir={run_dir}")
-    print(f"[replay] parser={fp['parser_sha256_16']} head={fp['repo_head']}")
+    print(f"[replay] parser={fp['parser_sha256_16']} head={fp['repo_head']} dirty={fp['repo_dirty']}")
+    if skipped:
+        print(f"[replay] skipped non-run files: {sorted(set(skipped))}")
     print(f"[replay] attempts={summary['attempt_counters']}")
     for r in summary["turns"]:
         print(
@@ -503,7 +540,8 @@ def _write_replay_diff(summary: dict, old: dict | None, path: str) -> None:
         "# 回放差异（当前 parser vs 产出该 run 的 parser）",
         "",
         f"- parser: `{summary['parser']['parser_sha256_16']}` "
-        f"(head {summary['parser']['repo_head']})",
+        f"(head {summary['parser']['repo_head']}, "
+        f"dirty={summary['parser'].get('repo_dirty')})",
         "",
     ]
     if old is None:
@@ -578,6 +616,11 @@ async def main() -> int:
     if os.getenv("W2A_STREAM_EXPERIMENT") != "1":
         print("REFUSED: set W2A_STREAM_EXPERIMENT=1 to run the real-account experiment")
         return 2
+
+    # live 路径才需要整套 CDP runtime（--replay 已在上面提前返回）。
+    from chatgpt_web2api.cdp_driver import CDPDriver
+    from chatgpt_web2api.chrome import ChromeProcess
+    from chatgpt_web2api.config import Config
 
     scenario_ids = ["S1", "S7"] if args.pilots else list(SCENARIOS.keys())
     if args.scenarios:

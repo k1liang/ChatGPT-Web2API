@@ -48,6 +48,9 @@ fail-close（宁可报失败，绝不把残缺结果当成功；评审 P1）：
 - ``unrouted_delta``：出现「单个字符串 ``v`` 字段」的帧但事件名不是
   ``delta``（形态 5 必须 ``event: delta``）。这是「正文通道被协议漂移
   绕过」的信号——静默丢正文与 S4 丢 ``}` 事故同类，因此同样 fail-close。
+- ``line_overflow``：单行超过 ``_MAX_LINE_CHARS`` 被丢弃。超长行往往是
+  一整条正文 delta/patch——丢掉它还继续报成功，与 ``text_overflow``
+  完全同类（评审 P1：原实现只计数不 fail，正文整行丢掉仍 ``matched``）。
 
 内存上界（production 承诺：解析完即弃，不落原始字节；评审 P1）：
 
@@ -57,7 +60,8 @@ fail-close（宁可报失败，绝不把残缺结果当成功；评审 P1）：
   因此常驻正文 ≈ 最新 target + 终态 assistant 两条（≤2 MiB）+ 终态
   快照（≤1 MiB）。``retained_text_chars()`` 供测试断言这个上界；
 - message 条数 ≤ ``_MAX_MESSAGES``（超限丢最老，只丢元数据）；
-- 单行缓冲 ≤ ``_MAX_LINE_CHARS``（超限计数并丢弃，不无限增长）。
+- 单行缓冲 ≤ ``_MAX_LINE_CHARS``（超限计数并丢弃，不无限增长；丢弃
+  本身是 fail-close 条件，见上）。
 
 多 POST 语义（矩阵 A2.4）：一个 logical turn 可能出现 0..N 个
 prepare/辅助 JSON POST + 1..N 个主流 SSE attempt（前端 retry）+ 0..N 个
@@ -187,6 +191,14 @@ class SendStreamParser:
                     self.line_overflow_count += 1
                     self._pending = ""
                 break
+            if nl > _MAX_LINE_CHARS:
+                # 完整行也超限：同样计数并丢弃。必须在这里查——只查 nl<0
+                # 分支时，同一超长行会因 chunk 边界不同而有时 fail 有时
+                # 不 fail（一次 feed 带换行到达就不触发），fail-close 必须
+                # 与 chunk 边界无关。
+                self.line_overflow_count += 1
+                self._pending = self._pending[nl + 1 :]
+                continue
             line = self._pending[:nl]
             self._pending = self._pending[nl + 1 :]
             self._handle_line(line)
@@ -459,7 +471,11 @@ class SendStreamParser:
     @property
     def protocol_drift(self) -> bool:
         """解析器看到的帧形态与已实测协议不符（正文可能被静默丢弃）。"""
-        return self.text_overflow or self.unrouted_delta_count > 0
+        return (
+            self.text_overflow
+            or self.unrouted_delta_count > 0
+            or self.line_overflow_count > 0
+        )
 
     @property
     def is_terminal(self) -> bool:
@@ -491,6 +507,8 @@ class SendStreamParser:
           绝不当作成功（被截断的 structured output 比失败更危险）；
         - ``unrouted_delta``：出现疑似正文帧但事件名不是 ``delta``——协议
           漂移，正文可能已被丢弃，同样 fail-close；
+        - ``line_overflow``：单行超过 ``_MAX_LINE_CHARS`` 被丢弃——被丢的
+          行可能就是一整条正文 delta，fail-close 同 ``text_overflow``；
         - ``aborted_before_terminal``：终态前流异常（含 AbortError）——失败；
         - ``eof_without_terminal``：EOF 到了却没有终态——正常路径不应出现
           （EOF 不是终态信号），视为协议漂移/失败；
@@ -504,6 +522,8 @@ class SendStreamParser:
             return "text_overflow"
         if self.unrouted_delta_count:
             return "unrouted_delta"
+        if self.line_overflow_count:
+            return "line_overflow"
         if self.is_terminal:
             return "matched"
         ended = self._eof or self._error is not None

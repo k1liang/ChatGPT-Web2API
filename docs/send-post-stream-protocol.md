@@ -38,6 +38,16 @@ attempt 序号（页面自增 aid）**不是** logical turn id。归属锚点有
 绝不退回「取缓存里最后一个 terminal」——上一轮的 late terminal / late
 retry 掉进本轮缓存时，靠这条规则被拒。
 
+**Commit C 的 production 接线（评审 P1，明确指令）**：``expected_user_message_id``
+不许让 stream 层自己猜。production 必须把现有 ``IdentityListener`` 在
+click_send 前 arm ``CaptureScope`` 捕获到的本轮 client UUID
+（``captured_uuid``，``send_and_stream`` 已持有）作为
+``expected_user_message_id`` 传入 ``select_turn_attempt``。不传 expected
+时锚点校验只证明 attempt **自洽**（request body id == in-band id），
+证明不了它属于**当前这一轮** send——上一轮的 late retry 自洽且 terminal
+时仍可能靠 last-wins 抢走结果。实验 driver 里的自洽 + prompt_match 是
+实验级证据，强度低于 production 的 expected 精确匹配。
+
 ## 2. 主流 framing
 
 SSE 语法（`data:` 行 + 空行分帧 + 可选 `event:` 行；CRLF/LF 均实测出现），
@@ -117,8 +127,9 @@ clone/读取端只拿到 `AbortError`，EOF 不会到达。因此：
 |---|---|---|
 | `text_overflow` | 终态 assistant 正文超过 1 MiB 上界被截断 | 截断的 structured output 被上层当成功使用，比失败更危险 |
 | `unrouted_delta` | 出现裸字符串 `v` 帧但事件名不是 `delta` | 正文通道被协议漂移绕过，正文可能已被静默丢弃 |
+| `line_overflow` | 单行超过 8 MiB 被丢弃（含跨 chunk 与单 feed 两种路径，与 chunk 边界无关） | 被丢的行可能就是一整条正文 delta——丢行后仍报成功与 `text_overflow` 修复前同类 |
 
-两者的 ``is_terminal`` 恒为 False，裁决（``select_turn_attempt``）因此
+三者的 ``is_terminal`` 恒为 False，裁决（``select_turn_attempt``）因此
 不会接受该 attempt。非终态消息（回声）的正文截断只计数、不 fail——
 它不进结果。
 
@@ -146,7 +157,8 @@ clone/读取端只拿到 `AbortError`，EOF 不会到达。因此：
 - 一条 message 一旦不再是最新 target 且不是终态 assistant，其正文**立即
   释放**（patch 只打最新 message，旧正文对状态机无用）；常驻正文 ≈
   最新 target + 终态 assistant + 终态快照；
-- message 条数 ≤ 128（只丢最老元数据）、单行缓冲 ≤ 8 MiB（超限计数丢弃）。
+- message 条数 ≤ 128（只丢最老元数据）、单行缓冲 ≤ 8 MiB（超限计数丢弃，
+  且**丢弃即 fail-close**，见 §3 的 ``line_overflow``）。
 
 ## 7. 实现
 

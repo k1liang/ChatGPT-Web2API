@@ -540,6 +540,42 @@ def test_line_buffer_overflow_is_counted_and_dropped(monkeypatch):
     assert len(p._pending) == 0  # 缓冲不增长
 
 
+def test_line_overflow_fails_closed(monkeypatch):
+    """超长行被丢弃 → 即使随后收到完整 terminal 也绝不 matched（评审 P1）。
+
+    被丢的行可能就是一整条正文 delta——只计数不 fail 会让「正文整行丢掉、
+    parser 仍返回成功」与 text_overflow 修复前的错误同类。
+    """
+    from chatgpt_web2api import response_stream as rs
+
+    monkeypatch.setattr(rs, "_MAX_LINE_CHARS", 400)
+    stream = (
+        sse('{"type":"input_message","input_message":{"id":"u-1",'
+            '"author":{"role":"user"}}}')
+        + sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+              '"status":"in_progress","content":{"parts":[""]}}}}')
+        # 超长正文 delta 行（505 字符，会被整体丢弃；合法 JSON 帧都 <400，
+        # 不得误伤）。
+        + b"data: " + b"X" * 500 + b"\n\n"
+        # 之后的 terminal 齐全：三条件 + message_stream_complete + [DONE]。
+        + sse('{"c":1,"o":"patch","v":[{"p":"/message/status","o":"replace",'
+              '"v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}')
+        + sse('{"type":"message_stream_complete","conversation_id":"c"}')
+        + sse("[DONE]")
+    )
+    p = parse_all("text/event-stream", [stream])
+    assert p.line_overflow_count == 1
+    assert p.assistant_terminal  # 三条件确实满足
+    assert p.assistant_text == ""  # 正文整行被丢
+    assert p.protocol_drift
+    assert not p.is_terminal  # 但 fail-close
+    assert p.outcome() == "line_overflow"
+    # 裁决同样不得接受它（不能靠调用方自觉）。
+    attempt = FakeAttempt("a1", "text/event-stream", stream, eof=True,
+                          request_body=req_body("u-1"))
+    assert pick_turn_attempt([attempt], expected_user_message_id="u-1") == (None, None)
+
+
 def test_delta_frame_requires_the_delta_event_name():
     """形态 5 必须 ``event: delta``：否则未来带字符串 v 的事件会被误拼进正文。
 
