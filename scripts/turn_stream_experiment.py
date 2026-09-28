@@ -113,7 +113,12 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
     # Method E（矩阵 AMENDMENT 2）: 页面内 fetch tee 的 raw framing capture。
     # 第一阶段**不解析** wire format——只落原始 chunk 字节 + 序号 + 时间戳 +
     # EOF，供离线判定它到底是 SSE / JSONL / 自定义 framing。
-    page_attempts = [a.to_dict(include_bytes=True) for a in d.take_page_stream_attempts()]
+    page_attempt_objs = d.take_page_stream_attempts()
+    page_attempts = [a.to_dict(include_bytes=True) for a in page_attempt_objs]
+    # Commit B: 增量 parser 对每个主流 attempt 出结构化结论——
+    # 「产生 terminal 的 attempt」即 logical turn 裁决（A2.4），并与
+    # production 通道（send_and_stream）拿到的文本做交叉校验。
+    stream_analysis = analyze_turn_stream(page_attempt_objs, streamed_text)
     # 诊断：页面可见文本（判断 UI 是否显示错误横幅 / 是否有 assistant 节点）
     page_text = ""
     page_url = ""
@@ -154,7 +159,54 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
         "network_observations": observations,
         "fetch_observations": fetch_observations,
         "page_attempts": page_attempts,
+        "stream_analysis": stream_analysis,
     }
+
+
+def analyze_turn_stream(attempts: list, streamed_text: str) -> dict:
+    """Commit B: 对一个 turn 的全部 page attempt 跑增量 parser。
+
+    裁决规则（A2.4）：产生 terminal 的主流 attempt 为准（多个取最后）；
+    verdict 携带 in-band 归组键（input_message 的 user message id）与
+    重建文本和 production 通道文本的一致性。
+    """
+    from chatgpt_web2api.response_stream import SendStreamParser
+
+    rows = []
+    winner = None  # (attempt_id, parser)
+    for a in attempts:
+        p = SendStreamParser(content_type=a.content_type)
+        if p.is_event_stream:
+            p.feed(a.raw_bytes())
+        if a.error:
+            p.mark_error(a.error)
+        elif a.eof:
+            p.mark_eof()
+        s = p.summary()
+        rows.append({"attempt_id": a.attempt_id, **s})
+        if p.is_terminal:
+            winner = (a.attempt_id, p)
+    if winner is not None:
+        aid, p = winner
+        # production 通道（DOM/projection 提取）的文本带 UI 标签前缀
+        # （实测 "ChatGPT 说：\n\n"），stream 重建的是纯 assistant 内容，
+        # 因此校验用包含而非全等。
+        return {
+            "verdict": "matched",
+            "winning_attempt": aid,
+            "user_message_id": p.user_message_id,
+            "assistant_message_id": p.assistant_message_id,
+            "conversation_id": p.conversation_id,
+            "assistant_text_len": len(p.assistant_text),
+            "matches_production_stream": (
+                bool(p.assistant_text) and p.assistant_text in streamed_text
+            ),
+            "attempts": rows,
+        }
+    # 没有 terminal 主流：记录最深刻的失败形态。
+    sse_rows = [r for r in rows if r["is_event_stream"]]
+    verdict = "no_stream" if not sse_rows else sse_rows[-1]["outcome"]
+    return {"verdict": verdict, "winning_attempt": None, "attempts": rows}
 
 
 async def run_scenario(d: CDPDriver, sid: str, repeat: int, timeout: float) -> dict:
@@ -223,6 +275,17 @@ def summarize(all_runs: list[dict]) -> dict:
                         if a["error"]
                     ],
                     "page_hook_events": turn.get("page_stream_stats", {}).get("events"),
+                    # Commit B: parser 裁决与文本交叉校验。
+                    "stream_verdict": (turn.get("stream_analysis") or {}).get("verdict"),
+                    "stream_winning_attempt": (turn.get("stream_analysis") or {}).get(
+                        "winning_attempt"
+                    ),
+                    "stream_text_matches": (turn.get("stream_analysis") or {}).get(
+                        "matches_production_stream"
+                    ),
+                    "stream_user_message_id": (turn.get("stream_analysis") or {}).get(
+                        "user_message_id"
+                    ),
                     "streamed_len": len(turn["streamed_text"]),
                     "dom_len": len(turn["dom_final_text"]),
                 }
@@ -233,15 +296,16 @@ def summarize(all_runs: list[dict]) -> dict:
 def write_markdown(summary: dict, path: str) -> None:
     lines = [
         "| scenario | repeat | turn | wall_ms | projGET | 429 | page attempts | page chunks | "
-        "page bytes | page EOFs | page errors | page events | dom asst | "
-        "streamed | dom | error |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "page bytes | page EOFs | page errors | page events | stream verdict | text match | "
+        "dom asst | streamed | dom | error |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in summary["turns"]:
         lines.append(
             "| {scenario} | {repeat} | {turn} | {wall_ms} | {projection_gets} | "
             "{projection_429s} | {page_attempts} | {page_chunks} | {page_bytes} | "
-            "{page_eofs} | {page_errors} | {page_hook_events} | {dom_assistant_nodes} | "
+            "{page_eofs} | {page_errors} | {page_hook_events} | {stream_verdict} | "
+            "{stream_text_matches} | {dom_assistant_nodes} | "
             "{streamed_len} | {dom_len} | {error} |".format(**r)
         )
     with open(path, "w", encoding="utf-8") as f:
@@ -255,6 +319,18 @@ async def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--pilots", action="store_true", help="smoke：仅 S1 + S7")
     group.add_argument("--full", action="store_true", help="全场景")
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="每场景重复次数（矩阵 A2.6：pilot 通过后 N=3）；文件名 <sid>_r<k>.json",
+    )
+    parser.add_argument(
+        "--scenarios",
+        type=str,
+        default=None,
+        help="逗号分隔的场景子集（如 S5,S6）；默认按 --pilots/--full 决定",
+    )
     parser.add_argument(
         "--capture",
         choices=["network", "fetch", "page", "both"],
@@ -270,6 +346,14 @@ async def main() -> int:
         return 2
 
     scenario_ids = ["S1", "S7"] if args.pilots else list(SCENARIOS.keys())
+    if args.scenarios:
+        requested = [s.strip() for s in args.scenarios.split(",") if s.strip()]
+        unknown = [s for s in requested if s not in SCENARIOS]
+        if unknown:
+            print(f"REFUSED: unknown scenarios {unknown}; known={list(SCENARIOS.keys())}")
+            return 2
+        scenario_ids = requested
+    repeats = max(1, int(args.repeats))
     run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(OUTPUT_ROOT, run_id)
     os.makedirs(out_dir, exist_ok=True)
@@ -296,14 +380,18 @@ async def main() -> int:
             await d.enable_fetch_stream_capture()
             print(f"[experiment] fetch capture: {d.fetch_stream_stats}", flush=True)
         for sid in scenario_ids:
-            print(f"[experiment] running {sid} ...", flush=True)
-            run = await run_scenario(d, sid, repeat=1, timeout=args.timeout)
-            all_runs.append(run)
-            with open(
-                os.path.join(out_dir, f"{sid}_r1.json"), "w", encoding="utf-8"
-            ) as f:
-                json.dump(run, f, ensure_ascii=False, indent=2)
-            print(f"[experiment] {sid} done", flush=True)
+            for repeat in range(1, repeats + 1):
+                print(
+                    f"[experiment] running {sid} r{repeat}/{repeats} ...",
+                    flush=True,
+                )
+                run = await run_scenario(d, sid, repeat=repeat, timeout=args.timeout)
+                all_runs.append(run)
+                with open(
+                    os.path.join(out_dir, f"{sid}_r{repeat}.json"), "w", encoding="utf-8"
+                ) as f:
+                    json.dump(run, f, ensure_ascii=False, indent=2)
+                print(f"[experiment] {sid} r{repeat} done", flush=True)
     finally:
         summary = summarize(all_runs)
         with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:

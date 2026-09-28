@@ -21,6 +21,7 @@ read, start with the [routing table](#which-doc-should-i-read) below.
 | **understand why we drive Chrome via CDP** | [adr-0001-automation-backend.md](adr-0001-automation-backend.md) |
 | **see what's planned / what already landed** | [ROADMAP.md](ROADMAP.md) |
 | **reverse-engineer a new ChatGPT endpoint** | [protocol-reference.md](protocol-reference.md) + [reverse-engineering-notes.md](reverse-engineering-notes.md) |
+| **understand the send POST stream wire format / terminal semantics** | [send-post-stream-protocol.md](send-post-stream-protocol.md) |
 
 ---
 
