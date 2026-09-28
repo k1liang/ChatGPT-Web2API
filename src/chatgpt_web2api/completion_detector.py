@@ -67,6 +67,10 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+# 消息节点选择器（含 2026-09-28 前端漂移的 fallback）。chatgpt_dom 不依赖本
+# 模块，顶层 import 无循环风险。
+from .chatgpt_dom import ASSISTANT_MESSAGE_SELECTOR
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
@@ -380,7 +384,9 @@ class CompletionDetector:
 
             try:
                 raw = await d._js_strict(
-                    "document.querySelectorAll('[data-message-author-role=\"assistant\"]').length"
+                    "document.querySelectorAll("
+                    f"'{ASSISTANT_MESSAGE_SELECTOR}'"
+                    ").length"
                 )
                 current_count = int(raw or 0)
             except CDPJSError:
@@ -477,7 +483,8 @@ class CompletionDetector:
             try:
                 result = await d._js_strict(
                     "(function() {"
-                    "  var msgs = document.querySelectorAll('[data-message-author-role=\"assistant\"]');"
+                    "  var msgs = document.querySelectorAll("
+                    f"    '{ASSISTANT_MESSAGE_SELECTOR}');"
                     "  if (!msgs.length) return JSON.stringify({text:'', md_text:'', html_len:0, child_count:0, has_action:false, is_thinking:false});"
                     "  var last = msgs[msgs.length - 1];"
                     # Text: the clean answer lives in ``.markdown`` textContent.

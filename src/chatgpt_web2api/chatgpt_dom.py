@@ -94,6 +94,29 @@ SEND_BUTTON_BROAD_SELECTOR = (
     'form:has(.ProseMirror) button[type="submit"]'
 )
 
+# Message-node selectors. 2026-09-28 前端漂移实测（CDP 现场验证，见
+# .gaifan/temp/stream-experiment/）：ChatGPT 已从消息节点移除
+# ``data-message-author-role`` 属性，改用
+# ``data-content-search-unit-key="fallback-turn-<turn>:<idx>:<role>"``
+# （user 气泡另有 ``data-user-message-bubble="true"``）。
+#
+# 影响面（实测复现）：detector 的 Phase-1 appear 循环与 Phase-2 探测全盲 →
+# 回答其实已渲染完成，却被判定 "no DOM progress" 并在 90s 后抛
+# GenerationStuckError（假失败）。旧属性保留为 fallback：老 bundle /
+# A-B 变体可能仍在用。
+#
+# 两个选择器都必须保持"每节点命中一次"：``$=`` 后缀匹配对
+# ``fallback-turn-N:M:assistant`` 唯一，不会误命中 user 节点。
+ASSISTANT_MESSAGE_SELECTOR = (
+    '[data-message-author-role="assistant"],'
+    ' [data-content-search-unit-key$=":assistant"]'
+)
+USER_MESSAGE_SELECTOR = (
+    '[data-message-author-role="user"],'
+    ' [data-content-search-unit-key$=":user"],'
+    ' [data-user-message-bubble="true"]'
+)
+
 # Send-button readiness poll. After a prior send completes (or under parallel
 # mode, where the MutationLock releases the instant a send finishes), ChatGPT's
 # composer can take several seconds to re-enable the send button — the composer

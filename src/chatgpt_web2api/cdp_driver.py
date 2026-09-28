@@ -48,7 +48,12 @@ RATE_LIMIT_DEFAULT_RETRY_AFTER = 60
 
 # Re-exported from backend_client (Phase 5 PR1 extraction) for back-compat.
 # Canonical home is now backend_client.py.
-from .backend_client import TOKEN_TTL_SECONDS  # noqa: E402,F401
+from .backend_client import (  # noqa: E402,F401
+    TOKEN_TTL_SECONDS,
+    # §14 typed 429（projection 层限流）：re-export 供调用方/测试统一从
+    # cdp_driver import；定义在 backend_client（projection fetch 的 owner）。
+    ProjectionRateLimitedError,
+)
 
 # Phase 5 PR4: generation-completion stall window + rate-limit pop-up text
 # matcher extracted into completion_detector.py; re-exported here for back-compat
@@ -58,10 +63,6 @@ from .completion_detector import (  # noqa: E402,F401
     PHASE_STALL_SECONDS,
     is_rate_limited_text,
 )
-
-# §14 typed 429（projection 层限流）。re-export 供调用方/测试统一从
-# cdp_driver import；定义在 backend_client（projection fetch 的 owner）。
-from .backend_client import ProjectionRateLimitedError  # noqa: E402,F401
 
 # How long to wait (seconds) for a freshly-created owned tab to settle on
 # chatgpt.com before refreshing the access token. ``_create_owned_tab`` only
@@ -82,10 +83,12 @@ _CONNECT_READY_TIMEOUT = 10
 # back-compat (tests import these from cdp_driver, and the navigation methods
 # that stay here still reference them).
 from .chatgpt_dom import (  # noqa: E402,F401
+    ASSISTANT_MESSAGE_SELECTOR,
     COMPOSER_FALLBACK_SELECTOR,
     COMPOSER_SELECTOR,
     SEND_BUTTON_FALLBACK_SELECTOR,
     SEND_BUTTON_SELECTOR,
+    USER_MESSAGE_SELECTOR,
 )
 
 # ── P2: Navigation readiness probe ────────────────────────────────────────
@@ -1562,12 +1565,12 @@ class CDPDriver:
 
         selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"assistant\"]'"
+            f"'{ASSISTANT_MESSAGE_SELECTOR}'"
             ").length"
         )
         user_selector = (
             "document.querySelectorAll("
-            "'[data-message-author-role=\"user\"]'"
+            f"'{USER_MESSAGE_SELECTOR}'"
             ").length"
         )
         max_attempts = 3
@@ -1673,7 +1676,7 @@ class CDPDriver:
                 result = await self._js_strict(
                     "(function() {"
                     "  var userMsgs = document.querySelectorAll("
-                    "    '[data-message-author-role=\"user\"]').length;"
+                    f"    '{USER_MESSAGE_SELECTOR}').length;"
                     f"  var composer = document.querySelector('{COMPOSER_SELECTOR}')"
                     f"       || document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
                     "  var composerPresent = !!composer;"

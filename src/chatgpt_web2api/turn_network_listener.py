@@ -220,10 +220,21 @@ class TurnNetworkListener:
             return
         error_text = params.get("errorText") or "unknown loading failure"
         obs.loading_failed_error = error_text
-        obs.body_outcome = "unavailable"
-        self.body_unavailable_count += 1
+        # Phase A 实测（2026-09-28 pilots）：send POST 返回 200 +
+        # text/event-stream 后出现 net::ERR_ABORTED，loadingFinished 从不触发。
+        # 此时仍尝试 getResponseBody——CDP 可能保留已接收的部分 body，这是
+        # 唯一能在"流被中断"场景拿到帧的 Network 手段（拿不到再走 §13
+        # Fetch domain）。成功则 outcome=captured 且 loading_failed_error
+        # 保留为中断上下文。
+        if self._body_tasks.get(request_id) is None:
+            self._body_tasks[request_id] = asyncio.get_event_loop().create_task(
+                self._fetch_body(obs)
+            )
+        else:
+            obs.body_outcome = "unavailable"
+            self.body_unavailable_count += 1
         logger.info(
-            "turn_network_observation loading_failed requestId=%s error=%s",
+            "turn_network_observation loading_failed requestId=%s error=%s (body fetch attempted)",
             request_id,
             error_text,
         )
@@ -248,6 +259,10 @@ class TurnNetworkListener:
             if obs.body:
                 obs.body_outcome = "captured"
                 self.body_captured_count += 1
+            elif obs.loading_failed_error:
+                # 流被中断且无残留 body：body 不可得（区别于"成功但空响应"）。
+                obs.body_outcome = "unavailable"
+                self.body_unavailable_count += 1
             else:
                 obs.body_outcome = "empty"
                 self.body_empty_count += 1

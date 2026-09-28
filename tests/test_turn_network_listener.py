@@ -167,14 +167,33 @@ async def test_empty_body_outcome():
 
 
 @pytest.mark.asyncio
-async def test_loading_failed_marks_unavailable():
-    driver = _make_driver()
+async def test_loading_failed_without_body_marks_unavailable():
+    """中断流且 getResponseBody 无残留 body → unavailable（Phase A pilot 实况）。"""
+    driver = _make_driver(get_response_body=AsyncMock(return_value={"result": {}}))
     listener = TurnNetworkListener(driver)
     await listener.attach()
     listener._on_response_received(_response_received_msg())
     listener._on_loading_failed(_loading_failed_msg(error="net::ERR_ABORTED"))
+    await asyncio.sleep(0.05)
     obs = listener.take_observations()
     assert obs[0].body_outcome == "unavailable"
+    assert obs[0].loading_failed_error == "net::ERR_ABORTED"
+
+
+@pytest.mark.asyncio
+async def test_loading_failed_with_partial_body_captures_it():
+    """中断流但 CDP 保留了已接收的帧 → captured，中断信息保留为上下文。"""
+    driver = _make_driver(
+        get_response_body=AsyncMock(return_value={"body": "data: partial", "base64Encoded": False})
+    )
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_failed(_loading_failed_msg(error="net::ERR_ABORTED"))
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "captured"
+    assert obs[0].body == "data: partial"
     assert obs[0].loading_failed_error == "net::ERR_ABORTED"
 
 
