@@ -616,9 +616,9 @@ class CDPDriver:
         hook = self._page_stream_hook
         if hook is None or not hook.is_installed():
             return
-        hook._installed = False
-        hook._script_id = None
-        hook._binding_added = False
+        # 旧会话的 binding/document-start script 已随 websocket 死亡：
+        # 先声明会话丢失，再走正常 install() 重新注册。
+        hook.mark_session_lost()
         await hook.install()
 
     def take_page_stream_attempts(self) -> list:

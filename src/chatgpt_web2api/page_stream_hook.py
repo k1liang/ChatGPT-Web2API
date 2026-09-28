@@ -61,6 +61,14 @@ BINDING_NAME = "__w2aTurnStreamEvent"
 # 保留的 attempt 上限（诊断数据）。
 _MAX_TRACKED = 16
 
+# 单 attempt 原始 chunk 的存储上限（字节）。raw capture 是实验诊断通道，
+# 超限后停止存字节但继续计数——防止长回答把 Python 侧内存吃穿。
+# 真实主流 ~22 KB，正常情况远够；超限本身是值得记录的异常信号。
+_MAX_ATTEMPT_BYTES = 4 * 1024 * 1024
+
+# fetch_seen 存储的 request body 上限（body 里含用户 prompt，只留诊断所需前缀）。
+_MAX_REQUEST_BODY = 64 * 1024
+
 # ── 页面侧 hook（在 document start、main world 执行）─────────────
 # 纪律：任何异常都必须吞掉——hook 绝不能影响页面行为（矩阵 A2.5 第 5 项）。
 _HOOK_SOURCE = r"""
@@ -198,6 +206,7 @@ class StreamAttempt:
     content_type: str | None = None
     chunks: list[StreamChunk] = field(default_factory=list)
     total_bytes: int = 0
+    dropped_chunk_count: int = 0
     eof: bool = False
     error: str | None = None
     opened_at: float | None = None
@@ -214,6 +223,7 @@ class StreamAttempt:
             "content_type": self.content_type,
             "chunk_count": len(self.chunks),
             "total_bytes": self.total_bytes,
+            "dropped_chunk_count": self.dropped_chunk_count,
             "eof": self.eof,
             "error": self.error,
             "opened_at": self.opened_at,
@@ -263,10 +273,18 @@ class PageStreamHook:
     async def install(self) -> bool:
         """装 binding + document-start hook。幂等。返回是否成功。
 
+        幂等语义：**已安装时直接返回 True，不产生任何新的 CDP 注册**——
+        重复 addScriptToEvaluateOnNewDocument 会泄漏 document-start script
+        （每个新文档都会多执行一份 hook），重复 addBinding 会互相覆盖。
+        重新注册只有两条合法路径：uninstall() 之后，或 CDP 会话重建后的
+        mark_session_lost()。
+
         顺序有意为之：**先 addBinding 再 addScriptToEvaluateOnNewDocument**
         —— hook 在 document start 就跑，此时 ``window.__w2aTurnStreamEvent``
         必须已经存在，否则首批事件会被静默丢掉。
         """
+        if self._installed:
+            return True
         d = self._driver
         try:
             # Runtime.bindingCalled 事件需要 Runtime 域开启。
@@ -327,6 +345,18 @@ class PageStreamHook:
     def is_installed(self) -> bool:
         return self._installed
 
+    def mark_session_lost(self) -> None:
+        """声明旧 CDP 会话已死（reconnect 场景）。
+
+        Runtime/Page 域注册都挂在 websocket 会话上：重连后旧 binding 与
+        document-start script 已随会话消失，Python 侧必须同步清掉本地状态，
+        才允许 install() 重新注册。**只清状态，不发 CDP 调用**——对已死的
+        会话发 removeScript/removeBinding 是无意义的（还可能拖慢重连）。
+        """
+        self._installed = False
+        self._script_id = None
+        self._binding_added = False
+
     # ── CDP event handler (fast, non-blocking) ─────────────────
 
     def _on_binding_called(self, msg: dict) -> None:
@@ -354,11 +384,14 @@ class PageStreamHook:
         obs = self._attempts.get(aid)
         try:
             if kind == "fetch_seen":
+                body = ev.get("body")
+                if isinstance(body, str) and len(body) > _MAX_REQUEST_BODY:
+                    body = body[:_MAX_REQUEST_BODY] + f"...<truncated {len(body)} bytes>"
                 obs = StreamAttempt(
                     attempt_id=aid,
                     url=str(ev.get("url") or ""),
                     method=ev.get("method"),
-                    request_body=ev.get("body"),
+                    request_body=body,
                     opened_at=time.monotonic(),
                 )
                 self._remember(obs)
@@ -391,7 +424,11 @@ class PageStreamHook:
                     byte_len=int(ev.get("len") or 0),
                     ts=ev.get("ts"),
                 )
-                obs.chunks.append(chunk)
+                if obs.total_bytes + chunk.byte_len <= _MAX_ATTEMPT_BYTES:
+                    obs.chunks.append(chunk)
+                else:
+                    # 超限：只计数不存字节（诊断通道也要有内存上界）。
+                    obs.dropped_chunk_count += 1
                 obs.total_bytes += chunk.byte_len
                 self.chunk_count += 1
             elif kind == "eof":

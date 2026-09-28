@@ -128,13 +128,65 @@ def test_uninstall_removes_handler_script_and_binding():
 
 
 def test_install_is_idempotent():
+    """幂等 = 第二次 install() 不产生任何新 CDP 注册。
+
+    重复 addScriptToEvaluateOnNewDocument 会泄漏 document-start script
+    （每个新文档多执行一份 hook），重复 addBinding 会互相覆盖——
+    因此重复调用必须零注册，而不是「无害地多注册一份」。
+    """
+
+    async def scenario():
+        d = FakeDriver()
+        hook = PageStreamHook(d)
+        assert await hook.install() is True
+        assert await hook.install() is True
+        assert await hook.install() is True
+        assert d.methods().count("Runtime.addBinding") == 1
+        assert d.methods().count("Page.addScriptToEvaluateOnNewDocument") == 1
+        assert d.methods().count("Runtime.enable") == 1
+        assert d.methods().count("Page.enable") == 1
+        assert hook.is_installed() is True
+        assert hook.stats["script_id"] == "script-1"
+
+    asyncio.run(scenario())
+
+
+def test_reinstall_after_uninstall_reregisters():
+    """uninstall 之后的 install 是合法重装路径（唯一入口之一）。"""
+
     async def scenario():
         d = FakeDriver()
         hook = PageStreamHook(d)
         await hook.install()
+        await hook.uninstall()
         await hook.install()
-        assert d.methods().count("Runtime.addBinding") == 2  # 重复调用无害
+        assert d.methods().count("Runtime.addBinding") == 2
+        assert d.methods().count("Page.addScriptToEvaluateOnNewDocument") == 2
         assert hook.is_installed() is True
+
+    asyncio.run(scenario())
+
+
+def test_mark_session_lost_allows_reinstall():
+    """reconnect 后：旧会话注册已死，mark_session_lost → install 重新注册。
+
+    期间不得对旧 script id 发 removeScript（会话已死，调用无意义）。
+    """
+
+    async def scenario():
+        d = FakeDriver()
+        hook = PageStreamHook(d)
+        await hook.install()
+        hook.mark_session_lost()
+        assert hook.is_installed() is False
+        assert hook.stats["script_id"] is None
+        n_before = d.methods().count("Page.removeScriptToEvaluateOnNewDocument")
+        await hook.install()
+        assert hook.is_installed() is True
+        # mark_session_lost 本身不发 CDP 调用；install 重新注册 binding+script。
+        assert d.methods().count("Page.removeScriptToEvaluateOnNewDocument") == n_before
+        assert d.methods().count("Runtime.addBinding") == 2
+        assert d.methods().count("Page.addScriptToEvaluateOnNewDocument") == 2
 
     asyncio.run(scenario())
 
@@ -251,6 +303,24 @@ def test_to_dict_can_omit_chunk_bytes():
     a.chunks.append(StreamChunk(index=0, b64="QUJD", byte_len=3))
     assert a.to_dict(include_bytes=False)["chunks"][0]["b64"] is None
     assert a.to_dict(include_bytes=True)["chunks"][0]["b64"] == "QUJD"
+
+
+def test_chunk_storage_is_bounded(monkeypatch):
+    """超过单 attempt 字节上限后只计数不存字节——诊断通道也要有内存上界。"""
+    from chatgpt_web2api import page_stream_hook as psh
+
+    monkeypatch.setattr(psh, "_MAX_ATTEMPT_BYTES", 10)
+    hook = PageStreamHook(FakeDriver())
+    hook._on_binding_called(
+        _binding_msg({"t": "fetch_seen", "aid": "a1", "url": "u", "method": "POST"})
+    )
+    hook._on_binding_called(_binding_msg(_chunk("a1", 0, b"A" * 8)))
+    hook._on_binding_called(_binding_msg(_chunk("a1", 1, b"B" * 8)))
+    a = hook.take_attempts()[0]
+    assert a.total_bytes == 16  # 计数不断
+    assert len(a.chunks) == 1  # 第二块超限，不存
+    assert a.dropped_chunk_count == 1
+    assert a.raw_bytes() == b"A" * 8
 
 
 def test_hook_source_never_reconstructs_response():
