@@ -3,7 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from chatgpt_web2api.cdp_driver import CDPDriver
-from chatgpt_web2api.turn_anchor import TurnTextResult
+from chatgpt_web2api.turn_anchor import TurnReconciliationError
+from chatgpt_web2api.turn_dom_runtime import DomTurnResult
 from chatgpt_web2api.turn_stream_runtime import (
     TurnStreamContext,
     TurnStreamResult,
@@ -34,6 +35,20 @@ class FakeIdentityListener:
         return self.uuid
 
 
+class FakeDomRuntime:
+    def __init__(self, result):
+        self.result = result
+        self.wait_calls = []
+
+    async def wait_for_turn(self, user_id, *, timeout):
+        self.wait_calls.append((user_id, timeout))
+        return self.result
+
+    @property
+    def stats(self):
+        return {"running": True}
+
+
 class FakeRuntime:
     def __init__(self, result):
         self.result = result
@@ -57,7 +72,7 @@ def _stream_driver(result):
     d._stream_primary_reason = "ready"
     d._turn_stream_runtime = FakeRuntime(result)
     d._identity_listener = FakeIdentityListener()
-    d._read_assistant_count_baseline = AsyncMock(return_value=0)
+    d._js_strict = AsyncMock(return_value=0)
     d.type_message = AsyncMock()
     d.click_send = AsyncMock()
     d._fetch_text_for_turn = AsyncMock(
@@ -112,7 +127,7 @@ async def test_stream_primary_bypasses_completion_and_projection():
 
 
 @pytest.mark.asyncio
-async def test_stream_failure_uses_exactly_one_recovery_fetch():
+async def test_stream_failure_without_dom_fails_closed_without_projection():
     result = TurnStreamResult(
         verdict="invalid_frame",
         conversation_id="conv-1",
@@ -129,17 +144,18 @@ async def test_stream_failure_uses_exactly_one_recovery_fetch():
         },
     )
     d = _stream_driver(result)
-    d._fetch_text_for_turn = AsyncMock(
-        return_value=TurnTextResult(status="matched", text="recovered")
-    )
 
-    chunks = [c async for c in d.send_and_stream("hello", timeout=5)]
+    with pytest.raises(TurnReconciliationError) as exc_info:
+        _ = [c async for c in d.send_and_stream("hello", timeout=5)]
 
-    assert "".join(c.delta for c in chunks if c.delta) == "recovered"
-    assert d._fetch_text_for_turn.await_count == 1
-    assert d.stream_primary_stats["completion_source"] == "stream_recovery"
-    assert d.stream_primary_stats["recovery_used"] is True
+    assert d._fetch_text_for_turn.await_count == 0
+    assert d.stream_primary_stats["completion_source"] is None
+    assert d.stream_primary_stats["recovery_used"] is False
     assert d.stream_primary_stats["protocol_drift"] is True
+    assert (
+        exc_info.value.diagnostic["projection_recovery"]
+        == "disabled_after_429_falsification"
+    )
 
 
 @pytest.mark.asyncio
@@ -176,3 +192,83 @@ async def test_adopted_unwrapped_tab_is_never_reloaded():
     d.install_page_stream_hook.assert_not_awaited()
     d._cdp.assert_not_awaited()
     assert d._stream_primary_reason == "adopt_unwrapped"
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_prefers_exact_turn_dom_secondary_over_projection():
+    stream = TurnStreamResult(
+        verdict="invalid_frame",
+        conversation_id="conv-1",
+        diagnostic={"attempt_count": 1, "retry_count": 0, "attempts": []},
+    )
+    d = _stream_driver(stream)
+    dom = DomTurnResult(
+        verdict="matched", assistant_text="dom answer",
+        conversation_id="conv-1", turn_id="u-1",
+    )
+    d._dom_secondary_available = True
+    d._dom_secondary_reason = "ready"
+    d._turn_dom_runtime = FakeDomRuntime(dom)
+
+    chunks = [c async for c in d.send_and_stream("hello", timeout=5)]
+
+    assert "".join(c.delta for c in chunks if c.delta) == "dom answer"
+    assert d._fetch_text_for_turn.await_count == 0
+    assert d.stream_primary_stats["completion_source"] == "dom_secondary"
+    assert d.stream_primary_stats["dom_outcome"] == "matched"
+    assert d._turn_dom_runtime.wait_calls[0][0] == "u-1"
+    d._completion.stream_until_complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stream_unavailable_uses_dom_secondary_without_projection():
+    d = _stream_driver(TurnStreamResult(verdict="unused"))
+    d._stream_primary_available = False
+    d._stream_primary_reason = "forced_unavailable"
+    d._dom_secondary_available = True
+    d._dom_secondary_reason = "ready"
+    d._turn_dom_runtime = FakeDomRuntime(
+        DomTurnResult(
+            verdict="matched", assistant_text="dom only",
+            conversation_id="conv-2", turn_id="u-1",
+        )
+    )
+
+    chunks = [c async for c in d.send_and_stream("hello", timeout=5)]
+
+    assert "".join(c.delta for c in chunks if c.delta) == "dom only"
+    assert d._fetch_text_for_turn.await_count == 0
+    assert d.stream_primary_stats["completion_source"] == "dom_secondary"
+    assert d.stream_primary_stats["outcome"] is None
+    d._completion.stream_until_complete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dom_failure_after_stream_failure_fails_closed_without_projection():
+    stream = TurnStreamResult(
+        verdict="invalid_frame", conversation_id="conv-1",
+        diagnostic={"attempt_count": 1, "retry_count": 0, "attempts": []},
+    )
+    d = _stream_driver(stream)
+    d._dom_secondary_available = True
+    d._dom_secondary_reason = "ready"
+    d._turn_dom_runtime = FakeDomRuntime(
+        DomTurnResult(
+            verdict="text_truncated", conversation_id="conv-1",
+            turn_id="u-1", diagnostic={"text_truncated": True},
+        )
+    )
+
+    with pytest.raises(TurnReconciliationError) as exc_info:
+        _ = [c async for c in d.send_and_stream("hello", timeout=5)]
+
+    assert d._fetch_text_for_turn.await_count == 0
+    assert d.stream_primary_stats["completion_source"] is None
+    assert d.stream_primary_stats["dom_outcome"] == "text_truncated"
+    assert d.stream_primary_stats["recovery_used"] is False
+    assert exc_info.value.diagnostic["dom_outcome"] == "text_truncated"
+    assert (
+        exc_info.value.diagnostic["projection_recovery"]
+        == "disabled_after_429_falsification"
+    )
+    d._completion.stream_until_complete.assert_not_called()

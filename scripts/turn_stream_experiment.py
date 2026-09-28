@@ -810,6 +810,165 @@ def _write_replay_diff(summary: dict, old: dict | None, path: str) -> None:
         f.write("\n".join(lines) + "\n")
 
 
+
+SECONDARY_MATRIX = {
+    "force_stream_fail": ["S1", "S4", "S5", "S6"],
+    "force_stream_unavailable": ["S1", "S5"],
+}
+SECONDARY_BASELINE = ".gaifan/temp/stream-experiment/20260928-192112/production-gate.json"
+SECONDARY_REJECTED_RECOVERY = (
+    ".gaifan/temp/stream-experiment/20260928-202429/secondary-gate.json"
+)
+
+
+async def run_secondary_scenario(
+    d: CDPDriver, method: str, sid: str, repeat: int, timeout: float
+) -> dict:
+    """Run one preregistered fault method without production test flags."""
+    from chatgpt_web2api.turn_stream_runtime import TurnStreamResult
+
+    original_stream_available = d._stream_primary_available
+    original_stream_reason = d._stream_primary_reason
+    original_stream_wait = d._turn_stream_runtime.wait_for_turn
+
+    async def forced_stream_failure(user_id, *, timeout, context):
+        return TurnStreamResult(
+            verdict="forced_stream_failure",
+            user_message_id=user_id,
+            diagnostic={
+                "attempt_count": 0,
+                "retry_count": 0,
+                "raw_bytes_retained": 0,
+                "attempts": [],
+                "forced": True,
+            },
+        )
+
+    try:
+        if method == "force_stream_fail":
+            d._turn_stream_runtime.wait_for_turn = forced_stream_failure
+        elif method == "force_stream_unavailable":
+            d._stream_primary_available = False
+            d._stream_primary_reason = "forced_unavailable"
+        else:
+            raise ValueError(f"unknown secondary method: {method}")
+        run = await run_scenario(d, sid, repeat=repeat, timeout=timeout)
+        run["method"] = method
+        return run
+    finally:
+        d._stream_primary_available = original_stream_available
+        d._stream_primary_reason = original_stream_reason
+        d._turn_stream_runtime.wait_for_turn = original_stream_wait
+
+
+def _secondary_output_failure(sid: str, turn: dict):
+    output = turn.get("streamed_text") or ""
+    ti = int(turn.get("turn_index") or 0)
+    if sid == "S1" and "MARKER-S1-1" not in output:
+        return "wrong_S1_output", output[:160]
+    if sid == "S5":
+        expected = f"MARKER-S5-{ti + 1}"
+        if expected not in output:
+            return "wrong_S5_output", output[:160]
+    if sid == "S6":
+        if not output.strip():
+            return "empty_S6_output", None
+        if ti == 1 and "Kai" not in output:
+            return "wrong_S6_memory_output", output[:160]
+    if sid == "S4":
+        try:
+            obj = json.loads(output.strip())
+        except Exception as e:
+            return "invalid_S4_json", str(e)
+        if obj != {"sum": 40, "product": 391}:
+            return "wrong_S4_json", obj
+    return None
+
+
+def evaluate_secondary_gate(all_runs: list[dict], *, smoke: bool = False) -> dict:
+    failures = []
+    rows = []
+    expected_source = {
+        "force_stream_fail": "dom_secondary",
+        "force_stream_unavailable": "dom_secondary",
+    }
+    for run in all_runs:
+        method = run["method"]
+        ids = []
+        for turn in run.get("turns") or []:
+            ps = turn.get("production_stream_stats") or {}
+            projection = turn.get("projection_stats") or {}
+            uid = ps.get("expected_user_id")
+            if uid:
+                ids.append(uid)
+            row = {
+                "method": method,
+                "scenario": run.get("scenario"),
+                "repeat": run.get("repeat"),
+                "turn": turn.get("turn_index"),
+                "source": ps.get("completion_source"),
+                "stream_outcome": ps.get("outcome"),
+                "dom_outcome": ps.get("dom_outcome"),
+                "expected_user_id": uid,
+                "projection_gets": projection.get("count", 0),
+                "projection_429s": projection.get("count429", 0),
+                "recovery_used": bool(ps.get("recovery_used")),
+                "raw_bytes_retained": ps.get("raw_bytes_retained", 0),
+                "dom_polls": ps.get("dom_poll_count", 0),
+                "completion_polls": ps.get("completion_poll_count", 0),
+                "error": turn.get("error"),
+            }
+            rows.append(row)
+            checks = [
+                (turn.get("error") is None, "turn_error", turn.get("error")),
+                (bool(uid), "missing_expected_user_id", uid),
+                (ps.get("completion_source") == expected_source[method], "completion_source", ps.get("completion_source")),
+                (ps.get("dom_outcome") == "matched", "dom_outcome", ps.get("dom_outcome")),
+                (projection.get("count", 0) == 0, "projection_count", projection.get("count", 0)),
+                (projection.get("count429", 0) == 0, "projection_429", projection.get("count429", 0)),
+                ((ps.get("dom_poll_count") or 0) == 0, "dom_polling", ps.get("dom_poll_count")),
+                ((ps.get("completion_poll_count") or 0) == 0, "completion_polling", ps.get("completion_poll_count")),
+                ((ps.get("raw_bytes_retained") or 0) == 0, "raw_bytes_retained", ps.get("raw_bytes_retained")),
+                (not ps.get("recovery_used"), "unexpected_recovery", ps.get("recovery_used")),
+            ]
+            for ok, reason, detail in checks:
+                if not ok:
+                    failures.append({
+                        "method": method, "scenario": run.get("scenario"),
+                        "repeat": run.get("repeat"), "turn": turn.get("turn_index"),
+                        "reason": reason, "detail": detail,
+                    })
+            out_fail = _secondary_output_failure(str(run.get("scenario")), turn)
+            if out_fail:
+                failures.append({
+                    "method": method, "scenario": run.get("scenario"),
+                    "repeat": run.get("repeat"), "turn": turn.get("turn_index"),
+                    "reason": out_fail[0], "detail": out_fail[1],
+                })
+        if len(ids) != len(set(ids)):
+            failures.append({
+                "method": method, "scenario": run.get("scenario"),
+                "repeat": run.get("repeat"), "turn": None,
+                "reason": "duplicate_turn_user_id", "detail": ids,
+            })
+    expected_turns = 1 if smoke else 27
+    if len(rows) != expected_turns:
+        failures.append({
+            "method": None, "scenario": None, "repeat": None, "turn": None,
+            "reason": "wrong_turn_count", "detail": {"actual": len(rows), "expected": expected_turns},
+        })
+    return {
+        "pass": not failures,
+        "smoke": smoke,
+        "baseline_reused": SECONDARY_BASELINE,
+        "rejected_projection_recovery_evidence": SECONDARY_REJECTED_RECOVERY,
+        "turn_count": len(rows),
+        "failure_count": len(failures),
+        "failures": failures,
+        "turns": rows,
+    }
+
+
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cdp-port", type=int, default=9222)
@@ -817,6 +976,14 @@ async def main() -> int:
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--pilots", action="store_true", help="smoke：仅 S1 + S7")
     group.add_argument("--full", action="store_true", help="全场景")
+    group.add_argument(
+        "--secondary-smoke", action="store_true",
+        help="DOM secondary driver smoke: force_stream_fail / S1 / N=1",
+    )
+    group.add_argument(
+        "--secondary-matrix", action="store_true",
+        help="run the preregistered DOM-secondary fault matrix in one driver",
+    )
     parser.add_argument(
         "--repeats",
         type=int,
@@ -875,7 +1042,17 @@ async def main() -> int:
     from chatgpt_web2api.chrome import ChromeProcess
     from chatgpt_web2api.config import Config
 
+    secondary_mode = bool(args.secondary_smoke or args.secondary_matrix)
+    secondary_plan = None
+    if args.secondary_smoke:
+        secondary_plan = {"force_stream_fail": ["S1"]}
+    elif args.secondary_matrix:
+        secondary_plan = SECONDARY_MATRIX
+
     scenario_ids = ["S1", "S7"] if args.pilots else list(SCENARIOS.keys())
+    if args.scenarios and secondary_mode:
+        print("REFUSED: --scenarios cannot modify the preregistered secondary matrix")
+        return 2
     if args.scenarios:
         requested = [s.strip() for s in args.scenarios.split(",") if s.strip()]
         unknown = [s for s in requested if s not in SCENARIOS]
@@ -883,8 +1060,8 @@ async def main() -> int:
             print(f"REFUSED: unknown scenarios {unknown}; known={list(SCENARIOS.keys())}")
             return 2
         scenario_ids = requested
-    elif not args.pilots and not args.full:
-        parser.error("one of --pilots / --full / --scenarios is required")
+    elif not args.pilots and not args.full and not secondary_mode:
+        parser.error("one of --pilots / --full / --scenarios / --secondary-* is required")
     if args.production_gate:
         if args.capture != "none":
             print("REFUSED: --production-gate requires --capture none")
@@ -892,7 +1069,14 @@ async def main() -> int:
         if "S8" in scenario_ids:
             print("REFUSED: S8 non-text is outside the textual production gate")
             return 2
-    repeats = max(1, int(args.repeats))
+    if secondary_mode:
+        if args.capture != "none":
+            print("REFUSED: --secondary-* requires --capture none")
+            return 2
+        if args.production_gate:
+            print("REFUSED: --production-gate and --secondary-* are separate gates")
+            return 2
+    repeats = 1 if args.secondary_smoke else (3 if args.secondary_matrix else max(1, int(args.repeats)))
     run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(OUTPUT_ROOT, run_id)
     os.makedirs(out_dir, exist_ok=True)
@@ -918,19 +1102,43 @@ async def main() -> int:
             # 只在本实验中开启，生产完成路径不启用。
             await d.enable_fetch_stream_capture()
             print(f"[experiment] fetch capture: {d.fetch_stream_stats}", flush=True)
-        for sid in scenario_ids:
-            for repeat in range(1, repeats + 1):
-                print(
-                    f"[experiment] running {sid} r{repeat}/{repeats} ...",
-                    flush=True,
-                )
-                run = await run_scenario(d, sid, repeat=repeat, timeout=args.timeout)
-                all_runs.append(run)
-                with open(
-                    os.path.join(out_dir, f"{sid}_r{repeat}.json"), "w", encoding="utf-8"
-                ) as f:
-                    json.dump(run, f, ensure_ascii=False, indent=2)
-                print(f"[experiment] {sid} r{repeat} done", flush=True)
+        if secondary_mode:
+            # Hard guard: if code regresses into the legacy detector, fail the
+            # run instead of silently hiding it behind a successful answer.
+            async def forbidden_legacy(*_args, **_kwargs):
+                raise AssertionError("legacy completion detector must not run")
+                yield  # pragma: no cover
+
+            d._completion.stream_until_complete = forbidden_legacy
+            for method, method_scenarios in secondary_plan.items():
+                for sid in method_scenarios:
+                    for repeat in range(1, repeats + 1):
+                        print(
+                            f"[secondary] {method} {sid} r{repeat}/{repeats} ...",
+                            flush=True,
+                        )
+                        run = await run_secondary_scenario(
+                            d, method, sid, repeat=repeat, timeout=args.timeout
+                        )
+                        all_runs.append(run)
+                        name = f"{method}__{sid}_r{repeat}.json"
+                        with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
+                            json.dump(run, f, ensure_ascii=False, indent=2)
+                        print(f"[secondary] {method} {sid} r{repeat} done", flush=True)
+        else:
+            for sid in scenario_ids:
+                for repeat in range(1, repeats + 1):
+                    print(
+                        f"[experiment] running {sid} r{repeat}/{repeats} ...",
+                        flush=True,
+                    )
+                    run = await run_scenario(d, sid, repeat=repeat, timeout=args.timeout)
+                    all_runs.append(run)
+                    with open(
+                        os.path.join(out_dir, f"{sid}_r{repeat}.json"), "w", encoding="utf-8"
+                    ) as f:
+                        json.dump(run, f, ensure_ascii=False, indent=2)
+                    print(f"[experiment] {sid} r{repeat} done", flush=True)
     finally:
         summary = summarize(all_runs)
         with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -959,6 +1167,19 @@ async def main() -> int:
             "recovery={primary_recovery_used} projGET={projection_gets} "
             "raw={primary_raw_bytes_retained} err={error}".format(**r)
         )
+
+    if secondary_mode:
+        gate = evaluate_secondary_gate(all_runs, smoke=bool(args.secondary_smoke))
+        gate_path = os.path.join(out_dir, "secondary-gate.json")
+        with open(gate_path, "w", encoding="utf-8") as f:
+            json.dump(gate, f, ensure_ascii=False, indent=2)
+        print(
+            f"[secondary-gate] pass={gate['pass']} turns={gate['turn_count']} "
+            f"failures={gate['failure_count']} artifact={gate_path}"
+        )
+        for failure in gate["failures"][:20]:
+            print(f"[secondary-gate] FAIL {failure}")
+        return 0 if gate["pass"] else 1
 
     if args.production_gate:
         gate = evaluate_production_gate(all_runs)

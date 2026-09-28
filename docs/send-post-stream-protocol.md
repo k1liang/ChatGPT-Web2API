@@ -180,3 +180,33 @@ False，裁决（``select_turn_attempt``）因此不会接受该 attempt。非�
   parser 重跑既有 run 目录的原始帧（不联网、不烧额度），产出
   `replay-summary.{json,md}` + `replay-attempts.json` + `replay-diff.md`
   （含 parser 指纹与新旧裁决差异）。parser 改协议后**先回放再上真机**。
+
+## 8. Production textual completion hierarchy（2026-09-28）
+
+文本 turn 的 production authority 已收敛为纯事件驱动链路：
+
+```text
+response stream primary
+  -> exact-turn DOM MutationObserver secondary
+  -> typed fail-closed
+```
+
+DOM secondary 使用 `IdentityListener.captured_uuid` 精确匹配当前 turn 的
+`data-turn-key`；只在 stream 不可用或 fail-close 后 arm，正常 stream path
+不启用 DOM completion observer。2026-09-28 的真实 secondary matrix 中：
+
+- `force_stream_fail`：18/18 textual turn 由 DOM secondary 完成，projection GET=0；
+- `force_stream_unavailable`：9/9 textual turn 由 DOM secondary 完成，projection GET=0；
+- S4 structured JSON 3/3 精确为 `{"sum":40,"product":391}`；
+- S5/S6 连续 turn 的 captured UUID 均唯一且未串线。
+
+**Automatic one-shot projection recovery 已被否定，不再属于 textual send path。**
+同一轮 matrix 的 `force_stream_and_dom_fail` 中，前 5 turn 的单次 projection
+GET 可返回，随后 S5 repeat 2/3 连续触发 HTTP 429；每个失败 turn 本身只有
+1 次 projection GET，没有 polling。按照 benchmark stop rule，不通过增加退避、
+节流或重试来“救”该方法。对应证据 run：
+`.gaifan/temp/stream-experiment/20260928-202429/secondary-gate.json`。
+
+因此 stream 与 DOM 两条事件通道都无法给出可信终态时，production **直接抛
+`TurnReconciliationError`**；projection 只保留为显式读取/诊断能力，不再由
+`send_and_stream()` 自动调用。

@@ -419,6 +419,13 @@ class CDPDriver:
         self._turn_stream_runtime = None
         self._stream_primary_available = False
         self._stream_primary_reason = "not_prepared"
+        # Event-driven DOM secondary. Dormant on stream-primary success; it is
+        # armed with the exact captured user UUID only after stream failure or
+        # when stream primary is unavailable.
+        self._page_dom_hook = None
+        self._turn_dom_runtime = None
+        self._dom_secondary_available = False
+        self._dom_secondary_reason = "not_prepared"
         self._stream_primary_stats: dict = {}
         # Runtime.bindingCalled 的多路分发器：所有 binding 共用这一个 CDP
         # method，多个 hook（流 / 未来的 DOM secondary）必须按 binding 名
@@ -708,12 +715,52 @@ class CDPDriver:
         self._stream_primary_reason = "ready"
         return True
 
+    async def _ensure_turn_dom_runtime(self):
+        from .page_dom_hook import PageDomHook
+        from .turn_dom_runtime import TurnDomRuntime
+
+        if self._page_dom_hook is None:
+            self._page_dom_hook = PageDomHook(self)
+        if self._turn_dom_runtime is None:
+            self._turn_dom_runtime = TurnDomRuntime(self)
+        await self._turn_dom_runtime.start(self._page_dom_hook)
+        return self._turn_dom_runtime
+
+    async def _prepare_dom_secondary_after_attach(self) -> bool:
+        """Install the dormant MutationObserver secondary on this document."""
+        self._dom_secondary_available = False
+        self._dom_secondary_reason = "preparing"
+        runtime = await self._ensure_turn_dom_runtime()
+        hook = runtime._hook
+        if not await hook.install():
+            self._dom_secondary_reason = "hook_install_failed"
+            return False
+        self._dom_secondary_available = True
+        self._dom_secondary_reason = "ready"
+        return True
+
+    @property
+    def dom_secondary_stats(self) -> dict:
+        out = {
+            "available": self._dom_secondary_available,
+            "availability_reason": self._dom_secondary_reason,
+        }
+        if self._page_dom_hook is not None:
+            out["hook"] = self._page_dom_hook.stats
+        if self._turn_dom_runtime is not None:
+            out["runtime"] = self._turn_dom_runtime.stats
+        return out
+
     def _reset_stream_primary_stats(self) -> None:
         self._stream_primary_stats = {
             "available": self._stream_primary_available,
             "availability_reason": self._stream_primary_reason,
             "completion_source": None,
             "expected_user_id": None,
+            "dom_secondary_available": self._dom_secondary_available,
+            "dom_secondary_reason": self._dom_secondary_reason,
+            "dom_outcome": None,
+            "dom_conversation_id": None,
             "winning_attempt": None,
             "attempt_count": 0,
             "retry_count": 0,
@@ -891,6 +938,7 @@ class CDPDriver:
         # reload only our owned tab if the current document was loaded before
         # the hook existed. Adopted tabs are never reloaded.
         await self._prepare_stream_primary_after_attach()
+        await self._prepare_dom_secondary_after_attach()
         await self._refresh_token()
         # Establish the send-readiness invariant before connect() returns: a
         # connected driver must be able to type a message. connect() may have
@@ -1022,10 +1070,16 @@ class CDPDriver:
         self._pending.clear()
         self._stream_primary_available = False
         self._stream_primary_reason = "reconnecting"
+        self._dom_secondary_available = False
+        self._dom_secondary_reason = "reconnecting"
         if self._page_stream_hook is not None:
             self._page_stream_hook.mark_session_lost()
         if self._turn_stream_runtime is not None:
             self._turn_stream_runtime.reset_session()
+        if self._page_dom_hook is not None:
+            self._page_dom_hook.mark_session_lost()
+        if self._turn_dom_runtime is not None:
+            self._turn_dom_runtime.reset_session()
 
         # Reconnect with backoff
         for attempt, delay in enumerate([2, 5, 10], 1):
@@ -1095,6 +1149,7 @@ class CDPDriver:
                 # or re-created) may have just navigated. See _wait_for_chatgpt_ready.
                 await self._wait_for_chatgpt_ready()
                 await self._prepare_stream_primary_after_attach()
+                await self._prepare_dom_secondary_after_attach()
                 await self._refresh_token()
                 logger.info("CDP reconnected on attempt %d", attempt)
                 # A2: re-attach the identity listener on the new websocket.
@@ -2036,44 +2091,6 @@ class CDPDriver:
             conversation_id_at_capture=conv_id,
         )
 
-    async def _recover_stream_turn_once(self, turn_anchor, stream_result):
-        """One-shot projection recovery; never polls or retries."""
-        from .turn_anchor import TurnReconciliationError
-
-        conv_id = stream_result.conversation_id or self._current_conv_id or ""
-        if not conv_id:
-            try:
-                conv_id = await self._conversation_id_from_url()
-            except Exception:
-                conv_id = ""
-        if not conv_id:
-            raise TurnReconciliationError(
-                conversation_id="",
-                anchor_mode=turn_anchor.mode,
-                last_status=stream_result.verdict,
-                diagnostic={"stream": stream_result.diagnostic},
-            )
-
-        result = await self._fetch_text_for_turn(conv_id, turn_anchor)
-        if result.status == "matched" and result.text is not None:
-            self._current_conv_id = conv_id
-            return result.text
-        if result.status == "non_text":
-            self._current_conv_id = conv_id
-            return (
-                "[Non-text response generated (image/tool-use/etc.) — "
-                "use get_conversation to retrieve full content.]"
-            )
-        raise TurnReconciliationError(
-            conversation_id=conv_id,
-            anchor_mode=turn_anchor.mode,
-            last_status=result.status,
-            diagnostic={
-                "stream": stream_result.diagnostic,
-                "last_fetch_diagnostic": result.diagnostic or {},
-            },
-        )
-
     async def send_and_stream(
         self,
         text: str,
@@ -2094,7 +2111,8 @@ class CDPDriver:
         5. type_message + click_send.
         6. Wait for the IdentityListener to capture the UUID (short timeout).
         7. Anchor = fallback.with_captured_id(uuid) if captured else fallback.
-        8. stream_until_complete(turn_anchor=anchor) + anchored reconciliation.
+        8. Exact-turn response stream is primary; exact-turn MutationObserver
+           is the event-driven secondary. If both fail, fail closed.
         9. ALWAYS: scope.close() in finally (clears capture state on every
            terminal path — success, timeout, exception, cancellation).
         """
@@ -2106,9 +2124,19 @@ class CDPDriver:
         # Per-turn observability starts before any send-side work.
         self._reset_projection_stats()
         self._reset_stream_primary_stats()
-        # Keep the baseline for the legacy compatibility path and send-ack
-        # fallback. This is a bounded pre-send DOM read, not completion polling.
-        initial_count = await self._read_assistant_count_baseline()
+        # Text completion is now event-driven end-to-end. Keep a best-effort
+        # user-count baseline only for the send-ack safety net; it is a single
+        # pre-send DOM read, never completion polling.
+        self._pre_send_user_count = None
+        try:
+            raw_user_count = await self._js_strict(
+                "document.querySelectorAll("
+                f"'{USER_MESSAGE_SELECTOR}'"
+                ").length"
+            )
+            self._pre_send_user_count = int(raw_user_count)
+        except Exception:
+            pass
 
         capture_scope = None
         if self._identity_listener is not None:
@@ -2118,16 +2146,16 @@ class CDPDriver:
             self._stream_primary_available
             and self._turn_stream_runtime is not None
         )
+        use_dom_secondary = (
+            self._dom_secondary_available
+            and self._turn_dom_runtime is not None
+        )
         stream_context = (
             self._turn_stream_runtime.begin_turn() if use_stream_primary else None
         )
-        # Crucial: normal stream-primary sends must not do a pre-send backend
-        # projection GET merely to prepare an unused fallback.
-        fallback_anchor = (
-            self._capture_projection_free_fallback_anchor(text)
-            if use_stream_primary
-            else await self._capture_pre_send_fallback_anchor(text)
-        )
+        # No textual path performs a pre-send projection GET. The captured
+        # POST UUID is the authority for both event-driven completion transports.
+        fallback_anchor = self._capture_projection_free_fallback_anchor(text)
         if self._identity_listener is not None and self._identity_listener.is_alive():
             capture_scope = self._identity_listener.arm_capture_scope(
                 expected_text_hash=hash_sent_text(text),
@@ -2180,11 +2208,16 @@ class CDPDriver:
             # A2 Step 7: build the final anchor (fallback + captured UUID).
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
 
-            # Production textual fast path: current-turn UUID from the
-            # IdentityListener is authoritative; completion/content come from
-            # the browser's own response stream. No DOM/projection polling.
-            if use_stream_primary and captured_uuid and stream_context is not None:
+            # Textual completion hierarchy:
+            #   response stream -> exact-turn MutationObserver -> typed fail-close.
+            # Automatic projection recovery was falsified by the secondary matrix;
+            # the old CompletionDetector polling loop is deliberately absent.
+            stream_result = None
+            completion_deadline = time.monotonic() + timeout
+            if captured_uuid:
                 self._stream_primary_stats["expected_user_id"] = captured_uuid
+
+            if use_stream_primary and captured_uuid and stream_context is not None:
                 stream_result = await self._turn_stream_runtime.wait_for_turn(
                     captured_uuid, timeout=timeout, context=stream_context
                 )
@@ -2213,125 +2246,69 @@ class CDPDriver:
                         yield StreamChunk(delta=stream_result.assistant_text)
                     yield StreamChunk(delta="", finish_reason="stop")
                     return
-
-                # A stream failure never falls into the old polling loop.
-                # Recovery is exactly one anchored projection read.
-                self._stream_primary_stats["recovery_used"] = True
-                recovered = await self._recover_stream_turn_once(
-                    turn_anchor, stream_result
-                )
-                self._stream_primary_stats["completion_source"] = "stream_recovery"
-                if recovered:
-                    yield StreamChunk(delta=recovered)
-                yield StreamChunk(delta="", finish_reason="stop")
-                return
-
-            if use_stream_primary:
-                # Missing UUID means the authoritative current-turn identity
-                # was unavailable. Preserve the legacy compatibility path;
-                # its anchor was captured without a pre-send projection GET.
-                self._stream_primary_stats["completion_source"] = "legacy"
+            elif use_stream_primary:
                 self._stream_primary_stats["outcome"] = "missing_user_anchor"
-            else:
-                self._stream_primary_stats["completion_source"] = "legacy"
 
-            # A2 Step 8: legacy stream + completion with the anchored turn.
-            # P1: pass budgets + model for the model-aware two-state phase-2
-            # machine. When None (no config available), the detector uses the
-            # legacy single PHASE_STALL_SECONDS behavior.
-            async for chunk in self._completion.stream_until_complete(
-                initial_count=initial_count,
-                timeout=timeout,
-                turn_anchor=turn_anchor,
-                budgets=budgets,
-                model=model,
-            ):
-                yield chunk
-
-            # Wait for URL to become /c/{id}
-            conv_id = ""
-            for _ in range(30):
-                try:
-                    url = await self._js_strict("window.location.href")
-                except CDPJSError:
-                    await asyncio.sleep(0.5)
-                    continue
-                if "/c/" in url:
-                    conv_id = url.split("/c/")[1].split("/")[0].split("?")[0]
-                    break
-                await asyncio.sleep(0.5)
-
-            if conv_id:
-                logger.info("Conversation: %s", conv_id)
-                self._current_conv_id = conv_id
-                last_dom_text = self._completion.last_dom_text
-                had_non_text_content = self._completion.had_non_text_content
-                # A2: anchored final-text reconciliation. The selector resolves
-                # the terminal assistant text for THIS turn (by captured UUID
-                # or dual-anchor fallback); stale text from a prior turn is
-                # never accepted.
-                last_status = "not_ready"
-                last_diagnostic = {}
-                for _ in range(60):
-                    try:
-                        result = await self._fetch_text_for_turn(conv_id, turn_anchor)
-                    except ProjectionRateLimitedError:
-                        # §14 typed 429 fail-fast：立刻终止 reconciliation
-                        # （旧行为是吞成 fetch_failed 继续把 60 次循环跑完，
-                        # 每秒一次 projection GET 继续烧配额）。
-                        logger.error(
-                            "projection 429 fail-fast after %d GETs this turn: %s",
-                            self._projection_stats.get("count", 0),
-                            self._projection_stats,
-                        )
-                        raise
-                    last_status = result.status
-                    last_diagnostic = result.diagnostic or {}
-                    if result.status == "matched" and result.text:
-                        if len(result.text) > len(last_dom_text):
-                            yield StreamChunk(delta=result.text[len(last_dom_text):])
-                            last_dom_text = result.text
-                        break
-                    if result.status == "non_text":
-                        # P2.5 RCA fix: non_text is NOT terminal here. The backend
-                        # propagates intermediary nodes (reasoning_recap, thoughts,
-                        # model_editable_context) BEFORE the final text node.
-                        # Treating non_text as terminal caused an intermittent
-                        # race: the reconciliation saw the intermediaries,
-                        # concluded "non-text", and yielded the placeholder even
-                        # though the text node would appear within seconds.
-                        # Now: keep polling (like not_ready) — the text node may
-                        # still be propagating. Only after the loop exhausts do we
-                        # yield the placeholder.
-                        pass
-                    if result.status in ("ambiguous", "degraded_not_fresh", "fetch_failed"):
-                        # Keep polling — these may resolve as the backend settles.
-                        pass
-                    # not_ready → keep polling.
-                    await asyncio.sleep(0.5)
-                else:
-                    # Loop exhausted without a text match.
-                    # If the last status was non_text (genuinely non-text
-                    # response after full polling), fall through to the
-                    # placeholder below. Otherwise raise a typed error.
-                    if last_status != "non_text":
-                        raise TurnReconciliationError(
-                            conversation_id=conv_id,
-                            anchor_mode=turn_anchor.mode,
-                            last_status=last_status,
-                            diagnostic={
-                                "captured_id": turn_anchor.captured_user_message_id,
-                                "had_non_text_content": had_non_text_content,
-                                "last_fetch_diagnostic": last_diagnostic,
-                            },
-                        )
-                # Non-text placeholder (unchanged from pre-A2).
-                if not last_dom_text and had_non_text_content:
-                    placeholder = (
-                        "[Non-text response generated (image/tool-use/etc.) — "
+            dom_result = None
+            if captured_uuid and use_dom_secondary:
+                remaining = max(0.1, completion_deadline - time.monotonic())
+                dom_result = await self._turn_dom_runtime.wait_for_turn(
+                    captured_uuid, timeout=remaining
+                )
+                self._stream_primary_stats["dom_outcome"] = dom_result.verdict
+                self._stream_primary_stats["dom_conversation_id"] = dom_result.conversation_id
+                if dom_result.matched:
+                    self._stream_primary_stats["completion_source"] = "dom_secondary"
+                    if dom_result.conversation_id:
+                        self._current_conv_id = dom_result.conversation_id
+                    if dom_result.assistant_text:
+                        yield StreamChunk(delta=dom_result.assistant_text)
+                    yield StreamChunk(delta="", finish_reason="stop")
+                    return
+                if dom_result.verdict == "non_text":
+                    self._stream_primary_stats["completion_source"] = "dom_secondary"
+                    yield StreamChunk(
+                        delta="[Non-text response generated (image/tool-use/etc.) — "
                         "use get_conversation to retrieve full content.]"
                     )
-                    yield StreamChunk(delta=placeholder)
+                    yield StreamChunk(delta="", finish_reason="stop")
+                    return
+
+            # Both event-driven transports are authoritative for textual
+            # completion. Automatic projection recovery was rejected by the
+            # 2026-09-28 secondary matrix: even one GET per failed turn hit
+            # HTTP 429 under repeated S5 turns. Do not add retries/backoff here;
+            # fail closed and leave projection as an explicit read/debug API.
+            if not captured_uuid:
+                last_status = "missing_user_anchor"
+            elif stream_result is None and dom_result is None:
+                last_status = "no_event_completion_transport"
+            else:
+                last_status = (
+                    getattr(dom_result, "verdict", None)
+                    or getattr(stream_result, "verdict", None)
+                    or "event_completion_failed"
+                )
+            raise TurnReconciliationError(
+                conversation_id=(
+                    getattr(dom_result, "conversation_id", None)
+                    or getattr(stream_result, "conversation_id", None)
+                    or self._current_conv_id
+                    or ""
+                ),
+                anchor_mode=turn_anchor.mode,
+                last_status=last_status,
+                diagnostic={
+                    "stream_available": use_stream_primary,
+                    "dom_available": use_dom_secondary,
+                    "stream": getattr(stream_result, "diagnostic", None),
+                    "stream_outcome": getattr(stream_result, "verdict", None),
+                    "dom": getattr(dom_result, "diagnostic", None),
+                    "dom_outcome": getattr(dom_result, "verdict", None),
+                    "projection_recovery": "disabled_after_429_falsification",
+                },
+            )
+
         finally:
             # A2 Step 9: ALWAYS clear the capture scope (failure-mode E).
             if capture_scope is not None:
@@ -2564,6 +2541,8 @@ class CDPDriver:
     async def close(self) -> None:
         if self._turn_stream_runtime is not None:
             await self._turn_stream_runtime.stop()
+        if self._turn_dom_runtime is not None:
+            await self._turn_dom_runtime.stop()
         # Stop the background reader first
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()
