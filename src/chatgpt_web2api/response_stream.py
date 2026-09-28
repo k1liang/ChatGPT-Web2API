@@ -50,7 +50,18 @@ fail-close（宁可报失败，绝不把残缺结果当成功；评审 P1）：
   绕过」的信号——静默丢正文与 S4 丢 ``}` 事故同类，因此同样 fail-close。
 - ``line_overflow``：单行超过 ``_MAX_LINE_CHARS`` 被丢弃。超长行往往是
   一整条正文 delta/patch——丢掉它还继续报成功，与 ``text_overflow``
-  完全同类（评审 P1：原实现只计数不 fail，正文整行丢掉仍 ``matched``）。
+  完全同类（评审 P1：原实现只计数不 fail，正文整行丢掉仍 ``matched``）；
+- ``invalid_frame``：SSE ``data:`` 帧无法 JSON 解析。无法解析就无法
+  证明它不是正文，静默丢弃后报成功与丢行同类；
+- ``invalid_utf8``：字节流不是合法 UTF-8。``errors="replace"`` 会把
+  底层改写过的正文（``A�B``）当成功交给上层——对 structured JSON
+  不可接受；合法编码的 U+FFFD 字符本身不受影响（它是合法 UTF-8）；
+- ``orphan_op``：``/message/...`` patch（或 delta 文本）到达时没有可用的
+  target。协议 contract 是「patch 打在最近加入的 message 上」，orphan
+  意味着 parser 状态与 wire 协议已脱节，最终正文不可信任。
+
+统一原则（评审 P1）：**任何已经造成输入信息丢失、且无法证明与 assistant
+正文无关的 parser 异常，都不能继续产出 matched。**
 
 内存上界（production 承诺：解析完即弃，不落原始字节；评审 P1）：
 
@@ -131,7 +142,9 @@ class SendStreamParser:
     def __init__(self, *, content_type: str | None = None) -> None:
         ct = (content_type or "").lower()
         self._is_event_stream = EVENT_STREAM_MARK in ct
-        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # 严格 UTF-8：非法字节必须 fail-close，不能用 replace 静默改写正文
+        # 后当成功返回（评审 P1）。合法编码的 U+FFFD 字符本身不受影响。
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         self._pending = ""
         self._data_lines: list[str] = []
         self._event_name: str | None = None
@@ -160,6 +173,8 @@ class SendStreamParser:
         self.truncated_message_count = 0
         # fail-close 计数：正文帧没走 event: delta（协议漂移）。
         self.unrouted_delta_count = 0
+        # fail-close 计数：字节流不是合法 UTF-8（strict decoder 抛错）。
+        self.utf8_error_count = 0
 
         self._messages: dict[str, _MessageState] = {}
         self._order: list[str] = []
@@ -181,7 +196,16 @@ class SendStreamParser:
             if len(self._raw_non_stream) < _MAX_NON_STREAM_BYTES:
                 self._raw_non_stream += data
             return
-        text = self._decoder.decode(data)
+        try:
+            text = self._decoder.decode(data)
+        except UnicodeDecodeError:
+            # 字节流已证明与协议假设不符：记录、丢弃缓冲、锁定 drift。
+            # decoder reset 后续 chunk 可继续解析（用于诊断），但 outcome
+            # 已不可能再是 matched。
+            self.utf8_error_count += 1
+            self._pending = ""
+            self._decoder.reset()
+            return
         self._pending += text
         while True:
             nl = self._pending.find("\n")
@@ -470,11 +494,18 @@ class SendStreamParser:
 
     @property
     def protocol_drift(self) -> bool:
-        """解析器看到的帧形态与已实测协议不符（正文可能被静默丢弃）。"""
+        """解析器看到的帧形态与已实测协议不符（正文可能被静默丢弃/改写）。
+
+        统一原则：任何已造成输入信息丢失、且无法证明与 assistant 正文无关
+        的异常（截断、丢行、丢帧、非法字节、orphan op）都算 drift。
+        """
         return (
             self.text_overflow
             or self.unrouted_delta_count > 0
             or self.line_overflow_count > 0
+            or self.invalid_frame_count > 0
+            or self.utf8_error_count > 0
+            or self.orphan_op_count > 0
         )
 
     @property
@@ -509,6 +540,12 @@ class SendStreamParser:
           漂移，正文可能已被丢弃，同样 fail-close；
         - ``line_overflow``：单行超过 ``_MAX_LINE_CHARS`` 被丢弃——被丢的
           行可能就是一整条正文 delta，fail-close 同 ``text_overflow``；
+        - ``invalid_frame``：``data:`` 帧无法 JSON 解析——无法证明它不是
+          正文，fail-close；
+        - ``invalid_utf8``：字节流不是合法 UTF-8——strict decoder 拒绝，
+          不把 replace 改写过的正文当成功；
+        - ``orphan_op``：patch/delta 到达时没有 target——parser 状态与
+          wire 协议脱节，最终正文不可信任；
         - ``aborted_before_terminal``：终态前流异常（含 AbortError）——失败；
         - ``eof_without_terminal``：EOF 到了却没有终态——正常路径不应出现
           （EOF 不是终态信号），视为协议漂移/失败；
@@ -524,6 +561,12 @@ class SendStreamParser:
             return "unrouted_delta"
         if self.line_overflow_count:
             return "line_overflow"
+        if self.invalid_frame_count:
+            return "invalid_frame"
+        if self.utf8_error_count:
+            return "invalid_utf8"
+        if self.orphan_op_count:
+            return "orphan_op"
         if self.is_terminal:
             return "matched"
         ended = self._eof or self._error is not None
@@ -562,6 +605,7 @@ class SendStreamParser:
             "other_ops": self.other_op_count,
             "message_overflows": self.message_overflow_count,
             "line_overflows": self.line_overflow_count,
+            "utf8_errors": self.utf8_error_count,
             "released_messages": self.released_message_count,
             "truncated_messages": self.truncated_message_count,
             "retained_text_chars": self.retained_text_chars(),

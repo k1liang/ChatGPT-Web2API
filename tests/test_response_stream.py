@@ -576,6 +576,95 @@ def test_line_overflow_fails_closed(monkeypatch):
     assert pick_turn_attempt([attempt], expected_user_message_id="u-1") == (None, None)
 
 
+def test_invalid_json_frame_fails_closed():
+    """无法 JSON 解析的 data: 帧 → 即使 terminal 齐全也绝不 matched（评审 P1）。
+
+    无法解析就无法证明它不是正文——静默丢弃后报成功与丢行同类。
+    合法的 ``data: "v1"``（delta_encoding 声明）是合法 JSON string，不受影响。
+    """
+    stream = (
+        sse('{"type":"input_message","input_message":{"id":"u-1",'
+            '"author":{"role":"user"}}}')
+        + sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+              '"status":"in_progress","content":{"parts":[""]}}}}')
+        # 畸形 JSON 正文帧（评审的构造：整条正文被丢）。
+        + b"event: delta\n" + sse('{"v":"LOST')  # 闭合括号缺失
+        + sse('{"c":1,"o":"patch","v":[{"p":"/message/status","o":"replace",'
+              '"v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}')
+        + sse('{"type":"message_stream_complete","conversation_id":"c"}')
+        + sse("[DONE]")
+    )
+    p = parse_all("text/event-stream", [stream])
+    assert p.invalid_frame_count == 1
+    assert p.assistant_text == ""
+    assert p.protocol_drift
+    assert not p.is_terminal
+    assert p.outcome() == "invalid_frame"
+    attempt = FakeAttempt("a1", "text/event-stream", stream, eof=True,
+                          request_body=req_body("u-1"))
+    assert pick_turn_attempt([attempt], expected_user_message_id="u-1") == (None, None)
+
+
+def test_invalid_utf8_fails_closed():
+    """非法 UTF-8 字节 → strict decoder 拒绝，不把 replace 改写过的正文当成功。"""
+    p = SendStreamParser(content_type="text/event-stream")
+    p.feed(b'event: delta\ndata: {"v":"A\xffB"}\n\n')
+    p.feed(sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+               '"status":"finished_successfully","end_turn":true,'
+               '"content":{"parts":["ok"]}}}}'))
+    p.feed(sse('{"type":"message_stream_complete","conversation_id":"c"}'))
+    p.feed(sse("[DONE]"))
+    p.mark_eof()
+    assert p.utf8_error_count == 1
+    assert p.protocol_drift
+    assert not p.is_terminal
+    assert p.outcome() == "invalid_utf8"
+
+
+def test_valid_utf8_replacement_char_is_not_an_error():
+    """合法编码的 U+FFFD 是合法 UTF-8：strict decoder 不误伤。"""
+    p = SendStreamParser(content_type="text/event-stream")
+    p.feed(sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+               '"status":"in_progress","content":{"parts":[""]}}}}'))
+    p.feed(b'event: delta\ndata: {"v":"A\xe2\x80\x8bB"}\n\n')  # U+200B 零宽空格
+    p.feed('event: delta\ndata: {"v":"替换符�合法"}\n\n'.encode())
+    p.feed(sse('{"c":1,"o":"patch","v":[{"p":"/message/status","o":"replace",'
+               '"v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}'))
+    p.mark_eof()
+    assert p.utf8_error_count == 0
+    assert p.orphan_op_count == 0
+    assert "替换符�合法" in p.assistant_text
+
+
+def test_orphan_patch_fails_closed():
+    """patch/delta 到达时没有 target → parser 状态与 wire 协议脱节，fail-close。
+
+    协议 contract：patch 打在最近加入的 message 上。orphan 说明前面的帧
+    已经丢失或未被理解，最终正文不可信任（评审 P1）。
+    """
+    stream = (
+        sse('{"type":"input_message","input_message":{"id":"u-1",'
+            '"author":{"role":"user"}}}')
+        # 此刻没有任何 message 加入（target=None）→ 正文 patch 成 orphan。
+        + sse('{"c":0,"p":"/message/content/parts/0","o":"append","v":"LOST"}')
+        + sse('{"c":1,"v":{"message":{"id":"m","author":{"role":"assistant"},'
+              '"status":"in_progress","content":{"parts":[""]}}}}')
+        + sse('{"c":2,"o":"patch","v":[{"p":"/message/status","o":"replace",'
+              '"v":"finished_successfully"},{"p":"/message/end_turn","o":"replace","v":true}]}')
+        + sse('{"type":"message_stream_complete","conversation_id":"c"}')
+        + sse("[DONE]")
+    )
+    p = parse_all("text/event-stream", [stream])
+    assert p.orphan_op_count == 1
+    assert p.assistant_text == ""
+    assert p.protocol_drift
+    assert not p.is_terminal
+    assert p.outcome() == "orphan_op"
+    attempt = FakeAttempt("a1", "text/event-stream", stream, eof=True,
+                          request_body=req_body("u-1"))
+    assert pick_turn_attempt([attempt], expected_user_message_id="u-1") == (None, None)
+
+
 def test_delta_frame_requires_the_delta_event_name():
     """形态 5 必须 ``event: delta``：否则未来带字符串 v 的事件会被误拼进正文。
 

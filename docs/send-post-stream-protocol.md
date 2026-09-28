@@ -128,10 +128,16 @@ clone/读取端只拿到 `AbortError`，EOF 不会到达。因此：
 | `text_overflow` | 终态 assistant 正文超过 1 MiB 上界被截断 | 截断的 structured output 被上层当成功使用，比失败更危险 |
 | `unrouted_delta` | 出现裸字符串 `v` 帧但事件名不是 `delta` | 正文通道被协议漂移绕过，正文可能已被静默丢弃 |
 | `line_overflow` | 单行超过 8 MiB 被丢弃（含跨 chunk 与单 feed 两种路径，与 chunk 边界无关） | 被丢的行可能就是一整条正文 delta——丢行后仍报成功与 `text_overflow` 修复前同类 |
+| `invalid_frame` | `data:` 帧无法 JSON 解析 | 无法解析就无法证明它不是正文，静默丢弃后报成功同类 |
+| `invalid_utf8` | 字节流不是合法 UTF-8（strict decoder） | `replace` 会把改写过的正文（`A� B`）当成功交给上层；合法编码的 U+FFFD 字符不受影响 |
+| `orphan_op` | patch/delta 到达时没有可用的 target | 协议 contract 是「patch 打在最近加入的 message 上」，orphan = parser 状态与 wire 协议脱节，最终正文不可信任 |
 
-三者的 ``is_terminal`` 恒为 False，裁决（``select_turn_attempt``）因此
-不会接受该 attempt。非终态消息（回声）的正文截断只计数、不 fail——
-它不进结果。
+统一原则：**任何已经造成输入信息丢失、且无法证明与 assistant 正文无关的
+parser 异常，都不能继续产出 matched。** 六者的 ``is_terminal`` 恒为
+False，裁决（``select_turn_attempt``）因此不会接受该 attempt。非终态
+消息（回声）的正文截断只计数、不 fail——它不进结果。真实帧反例检查：
+96 个 attempt（12 个 run 目录）中 `invalid_frames=0`、`orphan_ops=0`、
+`line_overflows=0`——不存在会被这三条误伤的「合法 orphan / 合法畸形帧」。
 
 ## 4. conversation_id
 
