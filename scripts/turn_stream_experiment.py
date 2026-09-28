@@ -815,6 +815,16 @@ SECONDARY_MATRIX = {
     "force_stream_fail": ["S1", "S4", "S5", "S6"],
     "force_stream_unavailable": ["S1", "S5"],
 }
+# A2.17: only fill the textual coverage holes left by SECONDARY_MATRIX.
+# Existing S1/S4/S5/S6 evidence is reused; do not rerun it.
+SECONDARY_COVERAGE_EXTENSION = {
+    "force_stream_fail": ["S2", "S3", "S7"],
+}
+# A2.18: non-text is a separate assay. Failure disables production
+# non-text success; it must not be tuned into the textual gate.
+SECONDARY_NONTEXT_MATRIX = {
+    "force_stream_fail": ["S8"],
+}
 SECONDARY_BASELINE = ".gaifan/temp/stream-experiment/20260928-192112/production-gate.json"
 SECONDARY_REJECTED_RECOVERY = (
     ".gaifan/temp/stream-experiment/20260928-202429/secondary-gate.json"
@@ -866,6 +876,22 @@ def _secondary_output_failure(sid: str, turn: dict):
     ti = int(turn.get("turn_index") or 0)
     if sid == "S1" and "MARKER-S1-1" not in output:
         return "wrong_S1_output", output[:160]
+    if sid == "S2":
+        words = output.split()
+        if len(words) < 200:
+            return "short_S2_output", {"words": len(words), "text": output[:160]}
+    if sid == "S3":
+        text = output.strip()
+        if len(text) < 500 or "triangle" not in text.lower():
+            return "short_or_wrong_S3_output", {
+                "chars": len(text),
+                "has_triangle": "triangle" in text.lower(),
+                "text": text[:160],
+            }
+    if sid == "S7" and "MARKER-S7-1" not in output:
+        return "wrong_S7_output", output[:160]
+    if sid == "S8" and "[Non-text response generated" not in output:
+        return "wrong_S8_non_text_output", output[:160]
     if sid == "S5":
         expected = f"MARKER-S5-{ti + 1}"
         if expected not in output:
@@ -885,7 +911,13 @@ def _secondary_output_failure(sid: str, turn: dict):
     return None
 
 
-def evaluate_secondary_gate(all_runs: list[dict], *, smoke: bool = False) -> dict:
+def evaluate_secondary_gate(
+    all_runs: list[dict],
+    *,
+    expected_turns: int,
+    smoke: bool = False,
+    non_text: bool = False,
+) -> dict:
     failures = []
     rows = []
     expected_source = {
@@ -919,11 +951,14 @@ def evaluate_secondary_gate(all_runs: list[dict], *, smoke: bool = False) -> dic
                 "error": turn.get("error"),
             }
             rows.append(row)
+            expected_dom_outcome = (
+                "non_text" if non_text and run.get("scenario") == "S8" else "matched"
+            )
             checks = [
                 (turn.get("error") is None, "turn_error", turn.get("error")),
                 (bool(uid), "missing_expected_user_id", uid),
                 (ps.get("completion_source") == expected_source[method], "completion_source", ps.get("completion_source")),
-                (ps.get("dom_outcome") == "matched", "dom_outcome", ps.get("dom_outcome")),
+                (ps.get("dom_outcome") == expected_dom_outcome, "dom_outcome", ps.get("dom_outcome")),
                 (projection.get("count", 0) == 0, "projection_count", projection.get("count", 0)),
                 (projection.get("count429", 0) == 0, "projection_429", projection.get("count429", 0)),
                 ((ps.get("dom_poll_count") or 0) == 0, "dom_polling", ps.get("dom_poll_count")),
@@ -951,7 +986,6 @@ def evaluate_secondary_gate(all_runs: list[dict], *, smoke: bool = False) -> dic
                 "repeat": run.get("repeat"), "turn": None,
                 "reason": "duplicate_turn_user_id", "detail": ids,
             })
-    expected_turns = 1 if smoke else 27
     if len(rows) != expected_turns:
         failures.append({
             "method": None, "scenario": None, "repeat": None, "turn": None,
@@ -960,6 +994,8 @@ def evaluate_secondary_gate(all_runs: list[dict], *, smoke: bool = False) -> dic
     return {
         "pass": not failures,
         "smoke": smoke,
+        "non_text": non_text,
+        "expected_turns": expected_turns,
         "baseline_reused": SECONDARY_BASELINE,
         "rejected_projection_recovery_evidence": SECONDARY_REJECTED_RECOVERY,
         "turn_count": len(rows),
@@ -983,6 +1019,14 @@ async def main() -> int:
     group.add_argument(
         "--secondary-matrix", action="store_true",
         help="run the preregistered DOM-secondary fault matrix in one driver",
+    )
+    group.add_argument(
+        "--secondary-coverage-extension", action="store_true",
+        help="A2.17: fill only the missing S2/S3/S7 DOM-secondary coverage",
+    )
+    group.add_argument(
+        "--secondary-nontext", action="store_true",
+        help="A2.18: run the separate S8 non-text DOM-secondary assay",
     )
     parser.add_argument(
         "--repeats",
@@ -1042,12 +1086,21 @@ async def main() -> int:
     from chatgpt_web2api.chrome import ChromeProcess
     from chatgpt_web2api.config import Config
 
-    secondary_mode = bool(args.secondary_smoke or args.secondary_matrix)
+    secondary_mode = bool(
+        args.secondary_smoke
+        or args.secondary_matrix
+        or args.secondary_coverage_extension
+        or args.secondary_nontext
+    )
     secondary_plan = None
     if args.secondary_smoke:
         secondary_plan = {"force_stream_fail": ["S1"]}
     elif args.secondary_matrix:
         secondary_plan = SECONDARY_MATRIX
+    elif args.secondary_coverage_extension:
+        secondary_plan = SECONDARY_COVERAGE_EXTENSION
+    elif args.secondary_nontext:
+        secondary_plan = SECONDARY_NONTEXT_MATRIX
 
     scenario_ids = ["S1", "S7"] if args.pilots else list(SCENARIOS.keys())
     if args.scenarios and secondary_mode:
@@ -1076,7 +1129,19 @@ async def main() -> int:
         if args.production_gate:
             print("REFUSED: --production-gate and --secondary-* are separate gates")
             return 2
-    repeats = 1 if args.secondary_smoke else (3 if args.secondary_matrix else max(1, int(args.repeats)))
+    repeats = (
+        1
+        if args.secondary_smoke
+        else (
+            3
+            if (
+                args.secondary_matrix
+                or args.secondary_coverage_extension
+                or args.secondary_nontext
+            )
+            else max(1, int(args.repeats))
+        )
+    )
     run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(OUTPUT_ROOT, run_id)
     os.makedirs(out_dir, exist_ok=True)
@@ -1169,7 +1234,17 @@ async def main() -> int:
         )
 
     if secondary_mode:
-        gate = evaluate_secondary_gate(all_runs, smoke=bool(args.secondary_smoke))
+        expected_turns = sum(
+            len(SCENARIOS[sid]["turns"]) * repeats
+            for method_scenarios in secondary_plan.values()
+            for sid in method_scenarios
+        )
+        gate = evaluate_secondary_gate(
+            all_runs,
+            expected_turns=expected_turns,
+            smoke=bool(args.secondary_smoke),
+            non_text=bool(args.secondary_nontext),
+        )
         gate_path = os.path.join(out_dir, "secondary-gate.json")
         with open(gate_path, "w", encoding="utf-8") as f:
             json.dump(gate, f, ensure_ascii=False, indent=2)

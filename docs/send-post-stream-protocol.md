@@ -195,10 +195,20 @@ DOM secondary 使用 `IdentityListener.captured_uuid` 精确匹配当前 turn �
 `data-turn-key`；只在 stream 不可用或 fail-close 后 arm，正常 stream path
 不启用 DOM completion observer。2026-09-28 的真实 secondary matrix 中：
 
-- `force_stream_fail`：18/18 textual turn 由 DOM secondary 完成，projection GET=0；
+- `force_stream_fail` 初始矩阵：18/18 textual turn 由 DOM secondary 完成，projection GET=0；
 - `force_stream_unavailable`：9/9 textual turn 由 DOM secondary 完成，projection GET=0；
+- A2.17 coverage extension（run `20260928-234045`）：S2/S3/S7 ×3 共 9/9 也由 DOM secondary 完成，projection GET=0、无 polling/recovery/raw retention；长文本/长推理没有出现 observer 过早完成；
 - S4 structured JSON 3/3 精确为 `{"sum":40,"product":391}`；
 - S5/S6 连续 turn 的 captured UUID 均唯一且未串线。
+
+**Non-text 仍不属于已验证 completion contract。** A2.18 按预注册 S8×3 开始
+真实 assay；首个 S8 turn（run `20260928-234457`）在 180.8s 后已经足以否定
+当前 DOM non-text success：`dom_outcome=no_terminal`、exact turn 下
+`assistant_nodes=0`、projection GET=0。按照 stop rule，r2/r3 被立即终止，
+不调整 selector/阈值、不启用 polling/projection 来救 benchmark。production
+因此不再把 DOM 的 `non_text` verdict 提升为 placeholder success；即使未来
+观察器产生该诊断，也必须 fail-close，直到另一个真实 non-text protocol
+matrix 建立可重复的完成契约。
 
 **Automatic one-shot projection recovery 已被否定，不再属于 textual send path。**
 同一轮 matrix 的 `force_stream_and_dom_fail` 中，前 5 turn 的单次 projection

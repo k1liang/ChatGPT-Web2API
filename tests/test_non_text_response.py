@@ -65,7 +65,7 @@ class DomRuntime:
 
 
 @pytest.mark.asyncio
-async def test_non_text_uses_dom_secondary_without_projection():
+async def test_non_text_dom_verdict_fails_closed_without_projection():
     d = CDPDriver(cdp_port=9222)
     d._stream_primary_available = True
     d._turn_stream_runtime = StreamRuntime()
@@ -79,9 +79,18 @@ async def test_non_text_uses_dom_secondary_without_projection():
     d._completion.stream_until_complete = MagicMock(
         side_effect=AssertionError("polling detector must not run")
     )
-    chunks = [c async for c in d.send_and_stream("generate image", timeout=5)]
-    text = "".join(c.delta for c in chunks if c.delta)
-    assert "Non-text response generated" in text
-    assert chunks[-1].finish_reason == "stop"
+
+    from chatgpt_web2api.turn_anchor import TurnReconciliationError
+
+    with pytest.raises(TurnReconciliationError) as exc_info:
+        _ = [c async for c in d.send_and_stream("generate image", timeout=5)]
+
     assert d.projection_stats["count"] == 0
-    assert d.stream_primary_stats["completion_source"] == "dom_secondary"
+    assert d.stream_primary_stats["completion_source"] is None
+    assert d.stream_primary_stats["dom_outcome"] == "non_text"
+    assert exc_info.value.diagnostic["dom_outcome"] == "non_text"
+    assert (
+        exc_info.value.diagnostic["projection_recovery"]
+        == "disabled_after_429_falsification"
+    )
+    d._completion.stream_until_complete.assert_not_called()

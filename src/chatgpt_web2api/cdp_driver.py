@@ -2265,14 +2265,16 @@ class CDPDriver:
                         yield StreamChunk(delta=dom_result.assistant_text)
                     yield StreamChunk(delta="", finish_reason="stop")
                     return
+                # A2.18 real S8 assay falsified DOM non-text completion:
+                # the exact-turn observer timed out with no assistant node at all.
+                # Keep non_text as a diagnostic verdict if the DOM ever emits it,
+                # but never promote it to a successful model completion without a
+                # separately established non-text protocol.
                 if dom_result.verdict == "non_text":
-                    self._stream_primary_stats["completion_source"] = "dom_secondary"
-                    yield StreamChunk(
-                        delta="[Non-text response generated (image/tool-use/etc.) — "
-                        "use get_conversation to retrieve full content.]"
+                    logger.warning(
+                        "dom_non_text_unverified: refusing placeholder success for turn %s",
+                        captured_uuid,
                     )
-                    yield StreamChunk(delta="", finish_reason="stop")
-                    return
 
             # Both event-driven transports are authoritative for textual
             # completion. Automatic projection recovery was rejected by the

@@ -228,3 +228,65 @@ def test_production_gate_rejects_recovery_and_projection():
     assert "completion_source" in reasons
     assert "recovery_used" in reasons
     assert "projection_get" in reasons
+
+
+def _secondary_run(sid: str, output: str, *, dom_outcome: str = "matched") -> dict:
+    turn = _turn_dict()
+    turn["streamed_text"] = output
+    turn["projection_stats"] = {"count": 0, "count429": 0}
+    turn["production_stream_stats"] = {
+        "completion_source": "dom_secondary",
+        "outcome": "forced_stream_failure",
+        "dom_outcome": dom_outcome,
+        "expected_user_id": f"u-{sid}",
+        "recovery_used": False,
+        "raw_bytes_retained": 0,
+        "dom_poll_count": 0,
+        "completion_poll_count": 0,
+    }
+    turn["error"] = None
+    return {
+        "method": "force_stream_fail",
+        "scenario": sid,
+        "repeat": 1,
+        "turns": [turn],
+    }
+
+
+def test_secondary_gate_accepts_textual_coverage_extension():
+    mod = _load_module()
+    runs = [
+        _secondary_run("S2", "word " * 220),
+        _secondary_run("S3", "triangle " + "reasoning " * 80),
+        _secondary_run("S7", "MARKER-S7-1"),
+    ]
+    gate = mod.evaluate_secondary_gate(runs, expected_turns=3)
+    assert gate["pass"] is True
+    assert gate["turn_count"] == 3
+
+
+def test_secondary_gate_rejects_early_long_answer_completion():
+    mod = _load_module()
+    runs = [
+        _secondary_run("S2", "word " * 20),
+        _secondary_run("S3", "triangle too short"),
+    ]
+    gate = mod.evaluate_secondary_gate(runs, expected_turns=2)
+    assert gate["pass"] is False
+    reasons = {f["reason"] for f in gate["failures"]}
+    assert "short_S2_output" in reasons
+    assert "short_or_wrong_S3_output" in reasons
+
+
+def test_secondary_gate_accepts_separate_non_text_assay():
+    mod = _load_module()
+    run = _secondary_run(
+        "S8",
+        "[Non-text response generated (image/tool-use/etc.) — use get_conversation to retrieve full content.]",
+        dom_outcome="non_text",
+    )
+    gate = mod.evaluate_secondary_gate(
+        [run], expected_turns=1, non_text=True
+    )
+    assert gate["pass"] is True
+    assert gate["non_text"] is True
