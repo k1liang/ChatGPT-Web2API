@@ -50,6 +50,39 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def cdp_result(msg: dict | None) -> dict:
+    """从 ``_cdp`` 的返回值里取出 CDP ``result`` 对象。
+
+    ``_cdp`` 的契约是返回**整条 CDP 消息**（reader loop 的
+    ``fut.set_result(msg)``）：成功为 ``{"id": N, "result": {...}}``，应用层
+    错误为 ``{"id": N, "error": {...}}``——**且不抛异常**。因此任何要读 reply
+    字段的调用点都必须先过这里；直接 ``msg.get("body")`` / ``msg.get("stream")``
+    会永远拿到 None，并把「读取成功但字段没取到」误报成「资源不可得」。
+    （2026-09-28 Phase A：该 bug 曾让 ``Network.getResponseBody`` 的
+    outcome 恒为 unavailable，几乎误触发 §13 Fetch domain 升级。）
+    """
+    if not isinstance(msg, dict):
+        return {}
+    result = msg.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+def cdp_error_text(msg: dict | None) -> str | None:
+    """CDP 应用层错误文案；无错误返回 None。
+
+    与 ``cdp_result`` 配对：``_cdp`` 不把 ``error`` 变成异常，所以调用点要
+    自己判错，否则错误会被静默吞掉（同 2026-09-28 Phase A 事故）。
+    """
+    if not isinstance(msg, dict):
+        return None
+    err = msg.get("error")
+    if not isinstance(err, dict):
+        return None
+    code = err.get("code")
+    text = err.get("message") or err.get("data") or "unknown CDP error"
+    return f"{code}: {text}" if code is not None else str(text)
+
+
 class CDPTransport:
     """Active page-websocket CDP wire primitives, composed by ``CDPDriver``.
 

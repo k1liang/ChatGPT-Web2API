@@ -407,6 +407,11 @@ class CDPDriver:
         # 诊断专用——不改生产完成路径)。与 identity listener 同构,connect/
         # reconnect 时 attach。
         self._turn_network_listener = None
+        # Phase A 第二方案（§21 停止条件 1 触发后）: Fetch 域 SSE 流捕获。
+        # Network.getResponseBody 对 send POST 不可得（前端 abort SSE），
+        # 改由 Fetch.requestPaused + takeResponseBodyAsStream + IO.read 取流。
+        # **默认不启用**（enable 会暂停请求，属侵入式），仅实验/诊断显式开启。
+        self._fetch_stream_capture = None
         # Tab isolation: the targetId of the tab this driver is attached to.
         # _owns_target records whether *we* created it: only tabs we created are
         # closed in close(), so a driver that adopted an existing tab (e.g.
@@ -510,6 +515,73 @@ class CDPDriver:
         if self._turn_network_listener is None:
             return []
         return self._turn_network_listener.take_observations()
+
+    async def enable_fetch_stream_capture(self) -> None:
+        """Phase A 第二方案: 开启 Fetch 域 SSE 流捕获（显式、侵入式）。
+
+        ``Fetch.enable`` 会暂停匹配的响应直到我们放行，因此**只在实验/
+        诊断**中调用，生产完成路径不启用。捕获器放行与读取都在后台任务
+        里做，暂停窗口只有一次 CDP 往返。
+        """
+        from .fetch_stream_capture import FetchStreamCapture
+
+        if self._fetch_stream_capture is None:
+            self._fetch_stream_capture = FetchStreamCapture(self)
+        await self._fetch_stream_capture.enable()
+
+    async def disable_fetch_stream_capture(self) -> None:
+        """关闭 Fetch 域捕获并注销 handler（幂等）。"""
+        if self._fetch_stream_capture is None:
+            return
+        await self._fetch_stream_capture.disable()
+
+    async def _reattach_fetch_stream_capture(self) -> None:
+        """reconnect 后按原状态恢复 Fetch 捕获（未启用则不做任何事）。"""
+        cap = self._fetch_stream_capture
+        if cap is None or not cap.is_enabled():
+            return
+        cap._enabled = False  # 新 websocket 上重新 enable
+        await cap.enable()
+
+    def take_fetch_stream_observations(self) -> list:
+        """取走本轮 Fetch 捕获的 SSE 流观测（含完整 body）。"""
+        if self._fetch_stream_capture is None:
+            return []
+        return self._fetch_stream_capture.take_observations()
+
+    @property
+    def fetch_stream_stats(self) -> dict:
+        """Fetch 捕获计数快照（诊断读出）。"""
+        cap = self._fetch_stream_capture
+        if cap is None:
+            return {"enabled": False}
+        return {
+            "enabled": cap.is_enabled(),
+            "paused": cap.paused_count,
+            "captured": cap.captured_count,
+            "errors": cap.error_count,
+            "continue_failed": cap.continue_failed_count,
+        }
+
+    @property
+    def turn_network_stats(self) -> dict:
+        """Phase A Network 观测计数快照（诊断读出）。
+
+        失败归因必需：`observations=0` 说明连 responseReceived 都没到
+        （请求可能压根没发出），而不是"body 取不到"。
+        """
+        listener = self._turn_network_listener
+        if listener is None:
+            return {"ready": False}
+        return {
+            "ready": listener.is_alive(),
+            "observations": listener.observation_count,
+            "captured": listener.body_captured_count,
+            "empty": listener.body_empty_count,
+            "unavailable": listener.body_unavailable_count,
+            "errors": listener.body_error_count,
+            "body_fetch_scheduled": listener.body_fetch_scheduled_count,
+        }
 
     @property
     def projection_stats(self) -> dict:
@@ -868,6 +940,9 @@ class CDPDriver:
                 await self._attach_identity_listener()
                 # Phase A: re-attach the diagnostic turn network listener.
                 await self._attach_turn_network_listener()
+                # Phase A 第二方案: Fetch 捕获是 websocket 级状态，重连后
+                # 必须重新 enable，否则实验中途断线会静默丢失观测。
+                await self._reattach_fetch_stream_capture()
                 # Success: clear CDP failure history and recover a half-open
                 # breaker. Only after refresh_token succeeds — a reconnect that
                 # reopens the socket but can't auth isn't a clean recovery.

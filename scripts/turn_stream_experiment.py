@@ -35,6 +35,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from chatgpt_web2api.cdp_driver import CDPDriver  # noqa: E402
+from chatgpt_web2api.chatgpt_dom import ASSISTANT_MESSAGE_SELECTOR  # noqa: E402
 from chatgpt_web2api.chrome import ChromeProcess  # noqa: E402
 from chatgpt_web2api.config import Config  # noqa: E402
 
@@ -106,24 +107,47 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
 
     dom_text = d._completion.last_dom_text
     observations = [o.to_dict(include_body=True) for o in d.take_turn_network_observations()]
+    # Phase A 第二方案（§21 停止条件 1）: Fetch 域捕获的 SSE 流。
+    # 未开启捕获时为空列表——两种通道的 outcome 都如实记录，便于评审对比。
+    fetch_observations = [o.to_dict(include_body=True) for o in d.take_fetch_stream_observations()]
     # 诊断：页面可见文本（判断 UI 是否显示错误横幅 / 是否有 assistant 节点）
     page_text = ""
     page_url = ""
+    dom_probe = {}
     try:
         page_url = await d._js_strict("window.location.href")
         page_text = await d._js_strict("document.body.innerText.slice(0, 800)")
+        # DOM 词表探针：stall 时"选择器找不到节点"和"节点确实没有文本"
+        # 是两种完全不同的故障，必须能当场区分（2026-09-28 DOM 漂移事故）。
+        raw = await d._js_strict(
+            "(function(){"
+            "  return JSON.stringify({"
+            "    new_units: document.querySelectorAll('[data-content-search-unit-key]').length,"
+            "    legacy_roles: document.querySelectorAll('[data-message-author-role]').length,"
+            "    user_bubbles: document.querySelectorAll('[data-user-message-bubble=\"true\"]').length,"
+            "    assistant_nodes: document.querySelectorAll("
+            f"      '{ASSISTANT_MESSAGE_SELECTOR}').length,"
+            "    body_len: document.body.innerText.length"
+            "  });"
+            "})()"
+        )
+        dom_probe = json.loads(raw)
     except Exception as e:
-        page_text = f"<page text unavailable: {e}>"
+        page_text = page_text or f"<page text unavailable: {e}>"
     return {
         "prompt": text,
         "streamed_text": streamed_text,
         "dom_final_text": dom_text,
         "page_url": page_url,
         "page_text_snippet": page_text,
+        "dom_probe": dom_probe,
         "wall_ms": wall_ms,
         "error": error,
         "projection_stats": d.projection_stats,
+        "network_stats": d.turn_network_stats,
+        "fetch_stats": d.fetch_stream_stats,
         "network_observations": observations,
+        "fetch_observations": fetch_observations,
     }
 
 
@@ -149,6 +173,9 @@ def summarize(all_runs: list[dict]) -> dict:
             obs = turn["network_observations"]
             captured = [o for o in obs if o["body_outcome"] == "captured"]
             outcomes = [o["body_outcome"] for o in obs]
+            fobs = turn.get("fetch_observations") or []
+            fcaptured = [o for o in fobs if o["outcome"] == "captured"]
+            foutcomes = [o["outcome"] for o in fobs]
             rows.append(
                 {
                     "scenario": run["scenario"],
@@ -163,6 +190,16 @@ def summarize(all_runs: list[dict]) -> dict:
                     "captured_body_size": max(
                         (o["body_size"] or 0) for o in captured
                     ) if captured else 0,
+                    "fetch_outcomes": foutcomes,
+                    "fetch_body_size": max(
+                        (o["body_size"] or 0) for o in fcaptured
+                    ) if fcaptured else 0,
+                    "net_observations": turn.get("network_stats", {}).get("observations"),
+                    "net_captured": turn.get("network_stats", {}).get("captured"),
+                    "net_unavailable": turn.get("network_stats", {}).get("unavailable"),
+                    "fetch_continue_failed": turn.get("fetch_stats", {}).get("continue_failed"),
+                    "dom_units": turn.get("dom_probe", {}).get("new_units"),
+                    "dom_assistant_nodes": turn.get("dom_probe", {}).get("assistant_nodes"),
                     "streamed_len": len(turn["streamed_text"]),
                     "dom_len": len(turn["dom_final_text"]),
                 }
@@ -172,13 +209,17 @@ def summarize(all_runs: list[dict]) -> dict:
 
 def write_markdown(summary: dict, path: str) -> None:
     lines = [
-        "| scenario | repeat | turn | wall_ms | projGET | 429 | capture outcomes | body size | streamed | dom | error |",
-        "|---|---|---|---|---|---|---|---|---|---|---|",
+        "| scenario | repeat | turn | wall_ms | projGET | 429 | net obs | net capture | "
+        "net size | fetch capture | fetch size | cont-fail | dom units | dom asst | "
+        "streamed | dom | error |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in summary["turns"]:
         lines.append(
             "| {scenario} | {repeat} | {turn} | {wall_ms} | {projection_gets} | "
-            "{projection_429s} | {capture_outcomes} | {captured_body_size} | "
+            "{projection_429s} | {net_observations} | {capture_outcomes} | "
+            "{captured_body_size} | {fetch_outcomes} | {fetch_body_size} | "
+            "{fetch_continue_failed} | {dom_units} | {dom_assistant_nodes} | "
             "{streamed_len} | {dom_len} | {error} |".format(**r)
         )
     with open(path, "w", encoding="utf-8") as f:
@@ -192,6 +233,12 @@ async def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--pilots", action="store_true", help="smoke：仅 S1 + S7")
     group.add_argument("--full", action="store_true", help="全场景")
+    parser.add_argument(
+        "--capture",
+        choices=["network", "fetch", "both"],
+        default="both",
+        help="捕获通道：network=Network.getResponseBody；fetch=Fetch 域取流（§21 停止条件 1）；both=同时开",
+    )
     args = parser.parse_args()
 
     if os.getenv("W2A_STREAM_EXPERIMENT") != "1":
@@ -214,6 +261,11 @@ async def main() -> int:
     all_runs = []
     try:
         await d.connect()
+        if args.capture in ("fetch", "both"):
+            # 侵入式：Fetch.enable 会暂停 send POST 的响应直到我们放行。
+            # 只在本实验中开启，生产完成路径不启用。
+            await d.enable_fetch_stream_capture()
+            print(f"[experiment] fetch capture: {d.fetch_stream_stats}", flush=True)
         for sid in scenario_ids:
             print(f"[experiment] running {sid} ...", flush=True)
             run = await run_scenario(d, sid, repeat=1, timeout=args.timeout)
@@ -229,6 +281,10 @@ async def main() -> int:
             json.dump(summary, f, ensure_ascii=False, indent=2)
         write_markdown(summary, os.path.join(out_dir, "summary.md"))
         try:
+            await d.disable_fetch_stream_capture()
+        except Exception:
+            pass
+        try:
             await d.close()
         except Exception:
             pass
@@ -239,7 +295,7 @@ async def main() -> int:
     for r in summary["turns"]:
         print(
             "{scenario} t{turn}: projGET={projection_gets} 429={projection_429s} "
-            "capture={capture_outcomes} err={error}".format(**r)
+            "net={capture_outcomes} fetch={fetch_outcomes} err={error}".format(**r)
         )
     return 0
 

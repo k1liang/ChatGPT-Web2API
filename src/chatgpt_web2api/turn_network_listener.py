@@ -42,6 +42,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 
+from .cdp_transport import cdp_error_text, cdp_result
+
 logger = logging.getLogger(__name__)
 
 # send POST 的 URL 后缀（与 IdentityListener._SEND_ENDPOINT_SUFFIX 一致）。
@@ -253,12 +255,28 @@ class TurnNetworkListener:
                 ),
                 timeout=_BODY_FETCH_TIMEOUT + 2,
             )
-            obs.body = resp.get("body")
-            obs.body_base64 = bool(resp.get("base64Encoded", False))
+            # _cdp 返回整条消息且不抛应用层错误——必须显式解包/判错，
+            # 否则 body 恒为 None（2026-09-28 Phase A 事故）。
+            err = cdp_error_text(resp)
+            result = cdp_result(resp)
+            obs.body = result.get("body")
+            obs.body_base64 = bool(result.get("base64Encoded", False))
             obs.body_size = len(obs.body) if isinstance(obs.body, str) else None
             if obs.body:
+                # 有 body 就以 body 为准（即便同时带错误：部分帧仍可用于解析）。
                 obs.body_outcome = "captured"
                 self.body_captured_count += 1
+                if err:
+                    obs.body_fetch_error = err
+            elif err:
+                obs.body_fetch_error = err
+                if "no resource with given identifier" in err.lower():
+                    # CDP 对已释放的流式响应的典型答复（§13 Fetch domain 备选）。
+                    obs.body_outcome = "unavailable"
+                    self.body_unavailable_count += 1
+                else:
+                    obs.body_outcome = "error"
+                    self.body_error_count += 1
             elif obs.loading_failed_error:
                 # 流被中断且无残留 body：body 不可得（区别于"成功但空响应"）。
                 obs.body_outcome = "unavailable"

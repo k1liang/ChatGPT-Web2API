@@ -20,7 +20,7 @@ from chatgpt_web2api.turn_network_listener import (
 def _make_driver(get_response_body: AsyncMock | None = None):
     d = MagicMock()
     d._cdp_event_handlers = {}
-    d._cdp = get_response_body or AsyncMock(return_value={"result": {}})
+    d._cdp = get_response_body or AsyncMock(return_value={"id": 1, "result": {}})
     return d
 
 
@@ -93,7 +93,7 @@ async def test_non_send_url_is_ignored():
 @pytest.mark.asyncio
 async def test_captured_body_full_lifecycle():
     driver = _make_driver(
-        get_response_body=AsyncMock(return_value={"body": "data: hello", "base64Encoded": False})
+        get_response_body=AsyncMock(return_value={"id": 1, "result": {"body": "data: hello", "base64Encoded": False}})
     )
     listener = TurnNetworkListener(driver)
     await listener.attach()
@@ -140,6 +140,77 @@ async def test_unavailable_when_get_response_body_reports_no_resource():
 
 
 @pytest.mark.asyncio
+async def test_body_lives_under_result_not_at_top_level():
+    """回归（2026-09-28 Phase A 事故）：``_cdp`` 返回整条消息。
+
+    修复前实现读 ``resp.get("body")``（顶层），而 body 在
+    ``resp["result"]["body"]`` —— 于是**每一轮** getResponseBody 都被误判成
+    unavailable，几乎把「代码没解包」当成「流式响应取不到 body」的实验结论，
+    进而误触发 §13 Fetch domain 升级。此测试锁死真实契约。
+    """
+    driver = _make_driver(
+        get_response_body=AsyncMock(
+            return_value={"id": 7, "result": {"body": "data: real", "base64Encoded": False}}
+        )
+    )
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_finished(_loading_finished_msg())
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "captured"
+    assert obs[0].body == "data: real"
+    assert listener.body_captured_count == 1
+    assert listener.body_unavailable_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cdp_error_reply_is_reported_not_swallowed():
+    """CDP 应用层错误走 ``{"error"}`` 且不抛异常 → 必须落到 body_fetch_error。"""
+    driver = _make_driver(
+        get_response_body=AsyncMock(
+            return_value={
+                "id": 8,
+                "error": {"code": -32000, "message": "No resource with given identifier found"},
+            }
+        )
+    )
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_finished(_loading_finished_msg())
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "unavailable"
+    assert "No resource with given identifier" in obs[0].body_fetch_error
+    assert listener.body_unavailable_count == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_body_wins_over_error_reply():
+    """错误答复里仍带部分 body 时以 body 为准（帧可用于解析）。"""
+    driver = _make_driver(
+        get_response_body=AsyncMock(
+            return_value={
+                "id": 9,
+                "error": {"code": -32000, "message": "stream closed"},
+                "result": {"body": "data: partial", "base64Encoded": False},
+            }
+        )
+    )
+    listener = TurnNetworkListener(driver)
+    await listener.attach()
+    listener._on_response_received(_response_received_msg())
+    listener._on_loading_finished(_loading_finished_msg())
+    await asyncio.sleep(0.05)
+    obs = listener.take_observations()
+    assert obs[0].body_outcome == "captured"
+    assert obs[0].body == "data: partial"
+    assert obs[0].body_fetch_error == "-32000: stream closed"
+
+
+@pytest.mark.asyncio
 async def test_error_when_get_response_body_fails_otherwise():
     driver = _make_driver(get_response_body=AsyncMock(side_effect=RuntimeError("cdp timeout")))
     listener = TurnNetworkListener(driver)
@@ -154,7 +225,7 @@ async def test_error_when_get_response_body_fails_otherwise():
 
 @pytest.mark.asyncio
 async def test_empty_body_outcome():
-    driver = _make_driver(get_response_body=AsyncMock(return_value={"body": "", "base64Encoded": False}))
+    driver = _make_driver(get_response_body=AsyncMock(return_value={"id": 1, "result": {"body": "", "base64Encoded": False}}))
     listener = TurnNetworkListener(driver)
     await listener.attach()
     listener._on_response_received(_response_received_msg())
@@ -169,7 +240,7 @@ async def test_empty_body_outcome():
 @pytest.mark.asyncio
 async def test_loading_failed_without_body_marks_unavailable():
     """中断流且 getResponseBody 无残留 body → unavailable（Phase A pilot 实况）。"""
-    driver = _make_driver(get_response_body=AsyncMock(return_value={"result": {}}))
+    driver = _make_driver(get_response_body=AsyncMock(return_value={"id": 1, "result": {}}))
     listener = TurnNetworkListener(driver)
     await listener.attach()
     listener._on_response_received(_response_received_msg())
@@ -184,7 +255,7 @@ async def test_loading_failed_without_body_marks_unavailable():
 async def test_loading_failed_with_partial_body_captures_it():
     """中断流但 CDP 保留了已接收的帧 → captured，中断信息保留为上下文。"""
     driver = _make_driver(
-        get_response_body=AsyncMock(return_value={"body": "data: partial", "base64Encoded": False})
+        get_response_body=AsyncMock(return_value={"id": 1, "result": {"body": "data: partial", "base64Encoded": False}})
     )
     listener = TurnNetworkListener(driver)
     await listener.attach()
