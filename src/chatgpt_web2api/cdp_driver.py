@@ -412,6 +412,10 @@ class CDPDriver:
         # 改由 Fetch.requestPaused + takeResponseBodyAsStream + IO.read 取流。
         # **默认不启用**（enable 会暂停请求，属侵入式），仅实验/诊断显式开启。
         self._fetch_stream_capture = None
+        # Method E（矩阵 AMENDMENT 2）: 页面内 fetch tee —— 事件驱动的真实
+        # 响应流观测。默认不安装（安装会改写页面 fetch，属侵入式），仅
+        # 实验/诊断显式开启；必须在 navigate 之前安装（前端会缓存 fetch 引用）。
+        self._page_stream_hook = None
         # Tab isolation: the targetId of the tab this driver is attached to.
         # _owns_target records whether *we* created it: only tabs we created are
         # closed in close(), so a driver that adopted an existing tab (e.g.
@@ -582,6 +586,54 @@ class CDPDriver:
             "errors": listener.body_error_count,
             "body_fetch_scheduled": listener.body_fetch_scheduled_count,
         }
+
+    async def install_page_stream_hook(self) -> bool:
+        """Method E: 安装页面内 fetch tee（显式、侵入式，实验/诊断专用）。
+
+        必须在 **navigate 之前**调用：hook 经
+        ``Page.addScriptToEvaluateOnNewDocument`` 在 document start 执行，
+        运行时再 override ``window.fetch`` 对已初始化完的前端无效。
+        返回是否安装成功；失败只降级为无观测，不影响生产路径。
+        """
+        from .page_stream_hook import PageStreamHook
+
+        if self._page_stream_hook is None:
+            self._page_stream_hook = PageStreamHook(self)
+        return await self._page_stream_hook.install()
+
+    async def uninstall_page_stream_hook(self) -> None:
+        """摘掉页面内 hook（幂等）。当前文档里的 wrapper 需 reload 才消失。"""
+        if self._page_stream_hook is None:
+            return
+        await self._page_stream_hook.uninstall()
+
+    async def _reinstall_page_stream_hook(self) -> None:
+        """reconnect 后按原状态恢复 hook（未安装则不做任何事）。
+
+        Runtime/Page 域状态挂在 websocket 会话上，重连后必须重装，
+        否则实验中途断线会静默丢失整个 turn 的流观测。
+        """
+        hook = self._page_stream_hook
+        if hook is None or not hook.is_installed():
+            return
+        hook._installed = False
+        hook._script_id = None
+        hook._binding_added = False
+        await hook.install()
+
+    def take_page_stream_attempts(self) -> list:
+        """取走本轮页面流 attempt（含原始 chunk）；一个 turn 可能多个（retry）。"""
+        if self._page_stream_hook is None:
+            return []
+        return self._page_stream_hook.take_attempts()
+
+    @property
+    def page_stream_stats(self) -> dict:
+        """页面流 hook 计数快照（诊断读出）。"""
+        hook = self._page_stream_hook
+        if hook is None:
+            return {"installed": False}
+        return hook.stats
 
     @property
     def projection_stats(self) -> dict:
@@ -943,6 +995,8 @@ class CDPDriver:
                 # Phase A 第二方案: Fetch 捕获是 websocket 级状态，重连后
                 # 必须重新 enable，否则实验中途断线会静默丢失观测。
                 await self._reattach_fetch_stream_capture()
+                # Method E: 页面流 hook 同样挂在会话上，重连后按原状态恢复。
+                await self._reinstall_page_stream_hook()
                 # Success: clear CDP failure history and recover a half-open
                 # breaker. Only after refresh_token succeeds — a reconnect that
                 # reopens the socket but can't auth isn't a clean recovery.

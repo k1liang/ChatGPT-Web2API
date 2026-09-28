@@ -110,6 +110,10 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
     # Phase A 第二方案（§21 停止条件 1）: Fetch 域捕获的 SSE 流。
     # 未开启捕获时为空列表——两种通道的 outcome 都如实记录，便于评审对比。
     fetch_observations = [o.to_dict(include_body=True) for o in d.take_fetch_stream_observations()]
+    # Method E（矩阵 AMENDMENT 2）: 页面内 fetch tee 的 raw framing capture。
+    # 第一阶段**不解析** wire format——只落原始 chunk 字节 + 序号 + 时间戳 +
+    # EOF，供离线判定它到底是 SSE / JSONL / 自定义 framing。
+    page_attempts = [a.to_dict(include_bytes=True) for a in d.take_page_stream_attempts()]
     # 诊断：页面可见文本（判断 UI 是否显示错误横幅 / 是否有 assistant 节点）
     page_text = ""
     page_url = ""
@@ -146,8 +150,10 @@ async def run_turn(d: CDPDriver, text: str, timeout: float) -> dict:
         "projection_stats": d.projection_stats,
         "network_stats": d.turn_network_stats,
         "fetch_stats": d.fetch_stream_stats,
+        "page_stream_stats": d.page_stream_stats,
         "network_observations": observations,
         "fetch_observations": fetch_observations,
+        "page_attempts": page_attempts,
     }
 
 
@@ -200,6 +206,23 @@ def summarize(all_runs: list[dict]) -> dict:
                     "fetch_continue_failed": turn.get("fetch_stats", {}).get("continue_failed"),
                     "dom_units": turn.get("dom_probe", {}).get("new_units"),
                     "dom_assistant_nodes": turn.get("dom_probe", {}).get("assistant_nodes"),
+                    # Method E: 一个 logical turn 可能有多个 attempt（前端 retry）。
+                    "page_attempts": len(turn.get("page_attempts") or []),
+                    "page_chunks": sum(
+                        a["chunk_count"] for a in (turn.get("page_attempts") or [])
+                    ),
+                    "page_bytes": sum(
+                        a["total_bytes"] for a in (turn.get("page_attempts") or [])
+                    ),
+                    "page_eofs": sum(
+                        1 for a in (turn.get("page_attempts") or []) if a["eof"]
+                    ),
+                    "page_errors": [
+                        a["error"]
+                        for a in (turn.get("page_attempts") or [])
+                        if a["error"]
+                    ],
+                    "page_hook_events": turn.get("page_stream_stats", {}).get("events"),
                     "streamed_len": len(turn["streamed_text"]),
                     "dom_len": len(turn["dom_final_text"]),
                 }
@@ -209,17 +232,16 @@ def summarize(all_runs: list[dict]) -> dict:
 
 def write_markdown(summary: dict, path: str) -> None:
     lines = [
-        "| scenario | repeat | turn | wall_ms | projGET | 429 | net obs | net capture | "
-        "net size | fetch capture | fetch size | cont-fail | dom units | dom asst | "
+        "| scenario | repeat | turn | wall_ms | projGET | 429 | page attempts | page chunks | "
+        "page bytes | page EOFs | page errors | page events | dom asst | "
         "streamed | dom | error |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in summary["turns"]:
         lines.append(
             "| {scenario} | {repeat} | {turn} | {wall_ms} | {projection_gets} | "
-            "{projection_429s} | {net_observations} | {capture_outcomes} | "
-            "{captured_body_size} | {fetch_outcomes} | {fetch_body_size} | "
-            "{fetch_continue_failed} | {dom_units} | {dom_assistant_nodes} | "
+            "{projection_429s} | {page_attempts} | {page_chunks} | {page_bytes} | "
+            "{page_eofs} | {page_errors} | {page_hook_events} | {dom_assistant_nodes} | "
             "{streamed_len} | {dom_len} | {error} |".format(**r)
         )
     with open(path, "w", encoding="utf-8") as f:
@@ -235,9 +257,11 @@ async def main() -> int:
     group.add_argument("--full", action="store_true", help="全场景")
     parser.add_argument(
         "--capture",
-        choices=["network", "fetch", "both"],
-        default="both",
-        help="捕获通道：network=Network.getResponseBody；fetch=Fetch 域取流（§21 停止条件 1）；both=同时开",
+        choices=["network", "fetch", "page", "both"],
+        default="page",
+        help="捕获通道：page=页面内 fetch tee（Method E，矩阵 AMENDMENT 2）；"
+        "network=Network.getResponseBody（已被否证）；fetch=Fetch 域取流"
+        "（已被否证，会卡页面）；both=network+page",
     )
     args = parser.parse_args()
 
@@ -261,6 +285,11 @@ async def main() -> int:
     all_runs = []
     try:
         await d.connect()
+        if args.capture in ("page", "both"):
+            # Method E: 必须在任何 navigate 之前安装——hook 走
+            # addScriptToEvaluateOnNewDocument，在前端 JS 初始化前生效。
+            ok = await d.install_page_stream_hook()
+            print(f"[experiment] page stream hook installed={ok} {d.page_stream_stats}", flush=True)
         if args.capture in ("fetch", "both"):
             # 侵入式：Fetch.enable 会暂停 send POST 的响应直到我们放行。
             # 只在本实验中开启，生产完成路径不启用。
@@ -285,6 +314,10 @@ async def main() -> int:
         except Exception:
             pass
         try:
+            await d.uninstall_page_stream_hook()
+        except Exception:
+            pass
+        try:
             await d.close()
         except Exception:
             pass
@@ -295,7 +328,8 @@ async def main() -> int:
     for r in summary["turns"]:
         print(
             "{scenario} t{turn}: projGET={projection_gets} 429={projection_429s} "
-            "net={capture_outcomes} fetch={fetch_outcomes} err={error}".format(**r)
+            "page(attempts={page_attempts} chunks={page_chunks} bytes={page_bytes} "
+            "eofs={page_eofs}) err={error}".format(**r)
         )
     return 0
 
