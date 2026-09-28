@@ -263,7 +263,7 @@ class CompletionDetector:
         must surface as auth expiry, not degrade to a generic stall (PR #39
         review finding #2 invariant — auth failure never degrades).
         """
-        from .cdp_driver import AuthExpiredError
+        from .cdp_driver import AuthExpiredError, ProjectionRateLimitedError
         from .turn_anchor import collapse_to_end_turn_status
 
         if not conv_id:
@@ -277,6 +277,8 @@ class CompletionDetector:
             return status == "complete"
         except AuthExpiredError:
             raise  # never swallow auth expiry — it must surface as auth expiry
+        except ProjectionRateLimitedError:
+            raise  # typed 429 — fail-fast（§14），不再吞成 False 让 stall 继续烧配额
         except Exception as e:
             logger.debug("Final reconciliation fetch failed: %s", e)
             return False
@@ -327,6 +329,7 @@ class CompletionDetector:
             AuthExpiredError,
             CDPJSError,
             GenerationStuckError,
+            ProjectionRateLimitedError,
             RateLimitError,
             StreamChunk,
         )
@@ -712,6 +715,12 @@ class CompletionDetector:
                     # Auth failure must NEVER degrade to DOM fallback.
                     # (PR #39 review finding #2 — the prior broad except
                     # swallowed this, violating "auth failure never degrades.")
+                    raise
+                except ProjectionRateLimitedError:
+                    # Typed 429 fail-fast（工作计划 §14）：429 曾被吞成
+                    # backend_fetch_failed → DOM fallback + 继续轮询 → 每秒
+                    # projection GET 继续烧配额。现在立刻打断 turn，由上层
+                    # 决定重试策略。
                     raise
                 except Exception as e:
                     # Transport/backend failure — treat as fetch_failed so the

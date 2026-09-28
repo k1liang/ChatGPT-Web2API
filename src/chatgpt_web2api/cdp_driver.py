@@ -59,6 +59,10 @@ from .completion_detector import (  # noqa: E402,F401
     is_rate_limited_text,
 )
 
+# §14 typed 429（projection 层限流）。re-export 供调用方/测试统一从
+# cdp_driver import；定义在 backend_client（projection fetch 的 owner）。
+from .backend_client import ProjectionRateLimitedError  # noqa: E402,F401
+
 # How long to wait (seconds) for a freshly-created owned tab to settle on
 # chatgpt.com before refreshing the access token. ``_create_owned_tab`` only
 # waits for the target's webSocketDebuggerUrl to appear in /json/list, which
@@ -413,6 +417,17 @@ class CDPDriver:
         # recover half-open breakers. None = back-compat (tests, legacy
         # construction) — every recorder checks `if self._breakers:`.
         self._breakers = breakers
+        # Phase A/§14: per-turn projection GET 指标（每次 send 开始时重置）。
+        # 覆盖点在 BackendClient._fetch_recent_conversation_projection——所有
+        # turn-anchored projection 读都经过它。429 归因看这里，不再靠
+        # "第 N 个 model call 失败"推测 backend quota。
+        self._projection_stats: dict = {
+            "count": 0,
+            "count429": 0,
+            "statuses": {},
+            "first429At": None,
+            "last429Headers": {},
+        }
         # Phase 5 PR1: backend-api fetch helpers extracted into BackendClient.
         # Lazy import (like _tab_registry) to avoid load-time coupling; the
         # client holds a back-reference to this driver for transport + state.
@@ -492,6 +507,21 @@ class CDPDriver:
         if self._turn_network_listener is None:
             return []
         return self._turn_network_listener.take_observations()
+
+    @property
+    def projection_stats(self) -> dict:
+        """本轮 send 的 projection GET 指标快照（§14 诊断读出）。"""
+        return dict(self._projection_stats)
+
+    def _reset_projection_stats(self) -> None:
+        """send_and_stream 开始时重置 per-turn projection 指标。"""
+        self._projection_stats = {
+            "count": 0,
+            "count429": 0,
+            "statuses": {},
+            "first429At": None,
+            "last429Headers": {},
+        }
 
     async def connect(self) -> None:
         """Connect to Chrome's CDP and authenticate.
@@ -1779,6 +1809,8 @@ class CDPDriver:
 
         # PR4 belt-and-suspenders: refuse to mutate the DOM in parallel mode.
         self._assert_owned_tab_required()
+        # §14: per-turn projection 指标从本 send 开始重新计数。
+        self._reset_projection_stats()
         # A1: count existing assistants BEFORE sending (fail-closed baseline).
         initial_count = await self._read_assistant_count_baseline()
 
@@ -1881,7 +1913,18 @@ class CDPDriver:
                 last_status = "not_ready"
                 last_diagnostic = {}
                 for _ in range(60):
-                    result = await self._fetch_text_for_turn(conv_id, turn_anchor)
+                    try:
+                        result = await self._fetch_text_for_turn(conv_id, turn_anchor)
+                    except ProjectionRateLimitedError:
+                        # §14 typed 429 fail-fast：立刻终止 reconciliation
+                        # （旧行为是吞成 fetch_failed 继续把 60 次循环跑完，
+                        # 每秒一次 projection GET 继续烧配额）。
+                        logger.error(
+                            "projection 429 fail-fast after %d GETs this turn: %s",
+                            self._projection_stats.get("count", 0),
+                            self._projection_stats,
+                        )
+                        raise
                     last_status = result.status
                     last_diagnostic = result.diagnostic or {}
                     if result.status == "matched" and result.text:

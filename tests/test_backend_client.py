@@ -237,3 +237,92 @@ async def test_create_memory_success_false_when_get_memories_no_match():
     result = await client.create_memory("remember this please")
     assert result["success"] is False
     driver.get_memories.assert_awaited_once()
+
+
+# ── §14: typed 429 fail-fast（projection 限流不再吞成 fetch_failed）────
+
+
+def _make_projection_429_driver():
+    client, driver = _make_client()
+    driver._projection_stats = {
+        "count": 0,
+        "count429": 0,
+        "statuses": {},
+        "first429At": None,
+        "last429Headers": {},
+    }
+    return client, driver
+
+
+@pytest.mark.asyncio
+async def test_projection_429_raises_typed_error_with_headers():
+    """429 → ProjectionRateLimitedError，带 Retry-After 与限流响应头子集。"""
+    from chatgpt_web2api.backend_client import ProjectionRateLimitedError
+
+    client, driver = _make_projection_429_driver()
+    driver._js_with_data_strict = AsyncMock(
+        return_value=json.dumps(
+            {"__status": 429, "__headers": {"retry-after": "120", "x-ratelimit-remaining": "0"}}
+        )
+    )
+    with pytest.raises(ProjectionRateLimitedError) as exc_info:
+        await client._fetch_recent_conversation_projection("conv-1")
+    assert exc_info.value.retry_after_seconds == 120
+    assert exc_info.value.headers["x-ratelimit-remaining"] == "0"
+    # Per-turn projection 指标必须真实记录这次 429（不再事后推测）。
+    assert driver._projection_stats["count"] == 1
+    assert driver._projection_stats["count429"] == 1
+    assert driver._projection_stats["statuses"] == {"429": 1}
+    assert driver._projection_stats["first429At"] is not None
+    assert driver._projection_stats["last429Headers"]["retry-after"] == "120"
+
+
+@pytest.mark.asyncio
+async def test_projection_429_propagates_through_text_wrapper():
+    """_fetch_text_for_turn 绝不把 429 降级为 fetch_failed（旧行为）。"""
+    from chatgpt_web2api.backend_client import ProjectionRateLimitedError
+    from chatgpt_web2api.turn_anchor import TurnAnchor
+
+    client, driver = _make_projection_429_driver()
+    driver._js_with_data_strict = AsyncMock(
+        return_value=json.dumps({"__status": 429, "__headers": {}})
+    )
+    anchor = TurnAnchor(
+        sent_text="hi",
+        mode="existing_conversation",
+        conversation_id_at_capture="conv-1",
+    )
+    with pytest.raises(ProjectionRateLimitedError):
+        await client._fetch_text_for_turn("conv-1", anchor)
+
+
+@pytest.mark.asyncio
+async def test_projection_429_propagates_through_end_turn_wrapper():
+    from chatgpt_web2api.backend_client import ProjectionRateLimitedError
+    from chatgpt_web2api.turn_anchor import TurnAnchor
+
+    client, driver = _make_projection_429_driver()
+    driver._js_with_data_strict = AsyncMock(
+        return_value=json.dumps({"__status": 429, "__headers": {}})
+    )
+    anchor = TurnAnchor(
+        sent_text="hi",
+        mode="existing_conversation",
+        conversation_id_at_capture="conv-1",
+    )
+    with pytest.raises(ProjectionRateLimitedError):
+        await client._fetch_end_turn_for_turn("conv-1", anchor, had_non_text_content=False)
+
+
+@pytest.mark.asyncio
+async def test_other_non_ok_status_still_maps_to_runtime_error():
+    """非 429 的非 OK 状态保持旧行为（RuntimeError → fetch_failed）。"""
+    client, driver = _make_projection_429_driver()
+    driver._js_with_data_strict = AsyncMock(
+        return_value=json.dumps({"__status": 503, "__headers": {}})
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        await client._fetch_recent_conversation_projection("conv-1")
+    assert "projection HTTP 503" in str(exc_info.value)
+    assert driver._projection_stats["count429"] == 0
+    assert driver._projection_stats["statuses"] == {"503": 1}

@@ -44,6 +44,46 @@ from .breakers import BreakerKind
 logger = logging.getLogger(__name__)
 
 
+class ProjectionRateLimitedError(RuntimeError):
+    """Backend conversation projection 返回 HTTP 429（工作计划 §14 typed 429）。
+
+    2026-09 429 根因链的教训：429 此前被解码成 ``RuntimeError`` → 包装成
+    ``fetch_failed`` → 调用方**继续轮询** → 每秒一次的 projection GET 继续烧
+    配额 → TurnReconciliationError（worker 日志
+    ``fetch_error='projection HTTP 429...'``）。本类型使 429 变成 fail-fast
+    信号：不再吞进 fetch_failed，直接打断当前 turn 的所有 projection 轮询。
+
+    语义决策：**不**继承 RateLimitError——RateLimitError 是 send-path 弹窗
+    错误，resilience 层会整轮重发；而 projection 429 发生在 send 成功之后，
+    重发会重复用户消息。调用方应把本错误当作 turn 失败上报，而不是重试。
+
+    Attributes:
+        conversation_id: 请求的会话 id。
+        headers: Retry-After / x-ratelimit-* / content-type 响应头子集。
+        retry_after_seconds: Retry-After 解析结果（秒），无法解析时为 None。
+    """
+
+    def __init__(self, conversation_id: str, headers: dict[str, str] | None = None) -> None:
+        self.conversation_id = conversation_id
+        self.headers = dict(headers or {})
+        retry_after_raw = self.headers.get("retry-after")
+        # HTTP Retry-After 是裸秒数（如 "120"）；cdp_driver.parse_retry_after
+        # 是弹窗文案解析器（"wait 2 minutes"），语义不同，不复用。非数字型
+        # （HTTP-date）保守置 None，调用方自行 backoff。
+        self.retry_after_seconds: float | None = None
+        if retry_after_raw:
+            try:
+                self.retry_after_seconds = float(retry_after_raw.strip())
+            except ValueError:
+                self.retry_after_seconds = None
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(self.headers.items()))
+        super().__init__(
+            f"projection HTTP 429 for {conversation_id}"
+            + (f" (retry_after={self.retry_after_seconds}s)" if self.retry_after_seconds else "")
+            + (f" headers: {detail}" if detail else "")
+        )
+
+
 class _Transient404(Exception):
     """Sentinel raised by ``_fetch_recent_conversation_projection`` on a backend 404.
 
@@ -281,6 +321,13 @@ class BackendClient:
 
         d = self._driver
         await self._driver.ensure_token()
+        # Per-turn projection 指标（工作计划 §14）：单一 chokepoint 覆盖
+        # detector 3s end_turn 轮询 + driver final reconciliation 等全部
+        # projection GET。以后看第几个 projection GET 429，不再用
+        # "第 N 个 model call 失败"反推 backend quota。
+        stats = getattr(d, "_projection_stats", None)
+        if isinstance(stats, dict):
+            stats["count"] += 1
         raw = await d._js_with_data_strict(
             CONVERSATION_PROJECTION_JS,
             {
@@ -298,7 +345,21 @@ class BackendClient:
                 payload = json.loads(raw)
                 status = payload.get("__status")
             except (json.JSONDecodeError, TypeError):
+                payload = {}
                 status = None
+            if isinstance(stats, dict) and status is not None:
+                stats["statuses"][str(status)] = stats["statuses"].get(str(status), 0) + 1
+            if status == 429:
+                # Typed 429 fail-fast（工作计划 §14）：绝不吞进 fetch_failed
+                # 继续轮询。429 时记录指标并立刻打断当前 turn。
+                if isinstance(stats, dict):
+                    stats["count429"] += 1
+                    if stats["first429At"] is None:
+                        import time as _time
+
+                        stats["first429At"] = _time.time()
+                    stats["last429Headers"] = dict(payload.get("__headers") or {})
+                raise ProjectionRateLimitedError(conversation_id, payload.get("__headers"))
             if status == 401:
                 if d._breakers:
                     d._breakers.trip(BreakerKind.AUTH_EXPIRED, "HTTP 401 from backend-api")
@@ -345,6 +406,8 @@ class BackendClient:
             return select_text_for_turn(mapping, anchor)
         except AuthExpiredError:
             raise  # hard fail — never degrade on auth
+        except ProjectionRateLimitedError:
+            raise  # typed 429 — fail-fast，绝不降级为 fetch_failed 继续轮询
         except _Transient404:
             # Transient race — mapping not yet propagated. Treat as not_ready.
             return TurnTextResult("not_ready", diagnostic={"reason": "transient_404"})
@@ -374,6 +437,8 @@ class BackendClient:
             )
         except AuthExpiredError:
             raise  # hard fail — never degrade on auth
+        except ProjectionRateLimitedError:
+            raise  # typed 429 — fail-fast，绝不降级为 fetch_failed 继续轮询
         except _Transient404:
             return TurnEndResult("not_ready", diagnostic={"reason": "transient_404"})
         except (CDPJSError, RuntimeError) as e:
