@@ -201,14 +201,64 @@ DOM secondary 使用 `IdentityListener.captured_uuid` 精确匹配当前 turn �
 - S4 structured JSON 3/3 精确为 `{"sum":40,"product":391}`；
 - S5/S6 连续 turn 的 captured UUID 均唯一且未串线。
 
-**Non-text 仍不属于已验证 completion contract。** A2.18 按预注册 S8×3 开始
-真实 assay；首个 S8 turn（run `20260928-234457`）在 180.8s 后已经足以否定
-当前 DOM non-text success：`dom_outcome=no_terminal`、exact turn 下
-`assistant_nodes=0`、projection GET=0。按照 stop rule，r2/r3 被立即终止，
-不调整 selector/阈值、不启用 polling/projection 来救 benchmark。production
-因此不再把 DOM 的 `non_text` verdict 提升为 placeholder success；即使未来
-观察器产生该诊断，也必须 fail-close，直到另一个真实 non-text protocol
-matrix 建立可重复的完成契约。
+**A2.18 当时仍未建立 non-text completion contract。** 该轮实际完成了
+S8×3（run `20260928-234457`）的全部三个 repeat，三轮均为
+`dom_outcome=no_terminal`、exact turn 下 `assistant_nodes=0`、projection GET=0；
+旧文档曾误写为 r1 后停止 r2/r3，现按实际 artifact 更正。该结果否定的是
+“生成过程中现有 assistant-text DOM observer 能直接判定 image success”，
+因此 `82bf22e` 保持 fail-close；没有通过调整 selector/阈值或恢复
+polling/projection 来救 benchmark。
+
+后续离线取证（raw SSE 重放再解析，见 `20260928-122034/replay-attempts.json`）
+发现 2026-09-28 的 S8 三轮 raw SSE 中确实存在非 terminal 的 assistant/thought
+message：新 parser 读出 `latest_assistant_message_id` 分别为 `8d85fa28...`、
+`bdb78bf5...`、`ad7c9182...`（`assistant_terminal=false`），且与完成后的 DOM
+快照 `.gaifan/temp/s8-image-dom.json` 中
+`[data-testid="generated-image-gallery"]` 最近的
+`data-chatgpt-search-message-ids` **3/3 精确相同**。即 stream→DOM
+assistant-id handoff 在该轮真实存在。
+
+**A2.19 non-text production matrix 已预注册并已执行，结果为 FAIL：**
+硬门禁为：stream outcome 必须为 `stream_complete_without_terminal`；
+completion source 必须为 `dom_secondary`；DOM outcome 必须为
+`matched_non_text`；kind=`image`、asset_count>=1；stream 与 DOM assistant
+message id 必须精确相同；projection GET/429、DOM/completion polling、raw
+retention、recovery 均为 0；3/3 无 turn error。任一条失败即停止，不修改
+timeout/selector/阈值来救 benchmark。
+
+真实 S8×3（run `20260929-120126`，CDP 19222，同一 driver 批量执行）
+**0/3 通过**，失败模式三轮完全一致：production stream 全部到达
+`no_terminal`，`stream_assistant_message_id` 3/3 为空——即当前
+production parser/runtime 未观测到可供 handoff 的 assistant anchor；
+该 matrix 使用 `--capture none`，不能据此判断 wire SSE 本身是否完全
+没有 assistant message。而 exact turn 下 DOM hook
+3/3 在 `captured_uuid` 的 exact turn root 内观察到 `generated-image-gallery`
+且图片已加载完成（DOM assistant id 分别为 `bd75228f...`、`967b66ee...`、
+`fadf4f1f...`）。三轮 wall_ms 均为 ~180.8s（等满 deadline 后 fail-close）。
+
+注意：现有 `TurnNetworkListener` 从设计上只监听
+`/backend-api/f/conversation`，A2.19 期间没有进行全量 network /
+websocket / eventsource 观测，因此不能据此判断是否存在独立异步
+asset/image channel。
+
+**分项结论（按 stop rule 停止，不调参救 benchmark）**：
+
+- **exact user-turn correlation: PASS（3/3）** —— `captured_uuid` →
+  exact turn root → image gallery 的 DOM 关联三轮全部成立；
+- **stream→DOM assistant-id corroboration: NOT STABLE** —— 2026-09-28
+  raw capture 中 assistant anchor 3/3 存在且与 DOM id 精确一致；
+  2026-09-29 production observation 中 stream assistant anchor 0/3
+  可用。造成差异的原因尚未定位，可能位于 wire/server variation、
+  attempt selection、parser/runtime observation path 等环节；在原因
+  定位之前，该 handoff 不能作为 mandatory production contract；
+- **terminal / usable-result contract: 未建立** —— 目前只有 gallery 存在
+  与图片加载完成，尚无稳定可消费的 asset URL / file id / structured
+  result。
+
+production 因此维持 `82bf22e` 的 typed fail-close；不得以 DOM-only
+corroboration、conversation-scope 关联或延时等弱信号替代 mandatory
+contract。后续方向是全通道 discovery 与 DOM exact-turn 的 terminal /
+result contract，而不是继续追 assistant-id correlation。
 
 **Automatic one-shot projection recovery 已被否定，不再属于 textual send path。**
 同一轮 matrix 的 `force_stream_and_dom_fail` 中，前 5 turn 的单次 projection
