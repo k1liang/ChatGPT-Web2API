@@ -22,6 +22,7 @@ from chatgpt_web2api.chatgpt_dom import (
     SEND_BUTTON_FALLBACK_SELECTOR,
     SEND_BUTTON_SELECTOR,
     ChatGPTDom,
+    first_visible_composer_js,
 )
 
 
@@ -86,6 +87,18 @@ def test_selectors_reexported_from_cdp_driver():
     assert cdp_driver.COMPOSER_FALLBACK_SELECTOR is COMPOSER_FALLBACK_SELECTOR
     assert cdp_driver.SEND_BUTTON_SELECTOR is SEND_BUTTON_SELECTOR
     assert cdp_driver.SEND_BUTTON_FALLBACK_SELECTOR is SEND_BUTTON_FALLBACK_SELECTOR
+
+
+def test_visible_composer_expression_filters_hidden_responsive_copies():
+    expression = first_visible_composer_js(COMPOSER_SELECTOR)
+
+    assert "querySelectorAll" in expression
+    assert "getBoundingClientRect" in expression
+    assert "getComputedStyle" in expression
+    assert "r.width > 0 && r.height > 0" in expression
+    assert "visibility !== 'hidden'" in expression
+    assert "display !== 'none'" in expression
+    assert "return nodes[0] || null" in expression
 
 
 # ── 3. Transport seam: DOM reaches driver._js / _js_strict / _cdp ─────

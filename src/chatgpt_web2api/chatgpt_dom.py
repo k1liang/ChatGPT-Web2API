@@ -76,6 +76,28 @@ logger = logging.getLogger(__name__)
 COMPOSER_SELECTOR = 'div[role="textbox"]#prompt-textarea, div[role="textbox"].ProseMirror'
 COMPOSER_FALLBACK_SELECTOR = "textarea#prompt-textarea"
 
+
+def first_visible_composer_js(selector: str) -> str:
+    """JS 表达式：命中多个 composer 节点时挑第一个可见的，返回元素或 null。
+
+    会话页有 3 个 ``div[role="textbox"].ProseMirror``（响应式布局保留的两个
+    0×0 不可见副本）；``querySelector`` 命中第一个不可见节点后，focus /
+    insert / verify 会全部打在隐藏元素上（实测 landing 页 1 个节点正常、
+    会话页 3 个节点 100% 失败）。按 rect + computed style 挑可见节点，
+    全部不可见时回退第一个命中。
+    """
+    return (
+        "(function(){"
+        f"  var nodes = document.querySelectorAll('{selector}');"
+        "  for (var i = 0; i < nodes.length; i++) {"
+        "    var r = nodes[i].getBoundingClientRect();"
+        "    var s = getComputedStyle(nodes[i]);"
+        "    if (r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none') return nodes[i];"
+        "  }"
+        "  return nodes[0] || null;"
+        "})()"
+    )
+
 # The send button. The new composer has no data-testid="send-button" —
 # its affordances are composer-plus-btn and dictation, plus a
 # stop-button while generating. The send affordance is the submit
@@ -237,7 +259,7 @@ class ChatGPTDom:
         # 'no composer') so the verify step reads the right element.
         focus_result = await d._js(
             "(function() {"
-            f"  var el = document.querySelector('{COMPOSER_SELECTOR}');"
+            f"  var el = {first_visible_composer_js(COMPOSER_SELECTOR)};"
             "  if (el) { el.focus(); return 'composer'; }"
             f"  var fb = document.querySelector('{COMPOSER_FALLBACK_SELECTOR}');"
             "  if (fb) { fb.focus(); return 'fallback'; }"
@@ -297,7 +319,7 @@ class ChatGPTDom:
             )
             await d._js_strict(
                 "(function(){"
-                f"  var el = document.querySelector('{verify_selector}');"
+                f"  var el = {first_visible_composer_js(verify_selector)};"
                 "  if (el) {"
                 "    if (el.tagName === 'TEXTAREA') {"
                 "      el.focus(); el.select();"
@@ -379,7 +401,7 @@ class ChatGPTDom:
         try:
             actual = await d._js_strict(
                 "(function(){"
-                f"  var el = document.querySelector('{selector}');"
+                f"  var el = {first_visible_composer_js(selector)};"
                 "  if (!el) return '';"
                 "  if (el.tagName === 'TEXTAREA') return el.value;"
                 # Recursive DOM extractor: walks all descendant nodes,
