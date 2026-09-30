@@ -609,8 +609,8 @@ class ChatGPTDom:
         try:
             snapshot = await d._js_strict(
                 "(function(){"
-                "  var composer = document.querySelector('" + COMPOSER_SELECTOR + "')"
-                "       || document.querySelector('" + COMPOSER_FALLBACK_SELECTOR + "');"
+                "  var composer = " + first_visible_composer_js(COMPOSER_SELECTOR) +
+                " || " + first_visible_composer_js(COMPOSER_FALLBACK_SELECTOR) + ";"
                 "  var sendCandidates = document.querySelectorAll('button[type=\"submit\"], button[aria-label*=\"Send\" i], button[data-testid=\"send-button\"]');"
                 "  var enabledSend = Array.prototype.filter.call(sendCandidates, function(b){ return !b.disabled; });"
                 "  var stopBtn = document.querySelector('[data-testid=\"stop-button\"], button[aria-label*=\"Stop\" i]');"
