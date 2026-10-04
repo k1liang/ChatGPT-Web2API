@@ -850,6 +850,9 @@ def test_selection_fails_closed_without_any_anchor():
     sel = select_turn_attempt([no_anchor])
     assert sel.verdict == "no_user_anchor" and sel.attempt is None
 
+    # in-band 缺失时退回 request 锚点：与期望 id 精确一致 → 接受
+    # （2026-10-04 验收现场实测：fresh 会话首 turn 的流里没有 input_message
+    # 帧，旧行为会把合法 turn 静默拒收到 hard budget 超时）。
     no_in_band = FakeAttempt(
         "a2", "text/event-stream",
         sse('{"c":0,"v":{"message":{"id":"m","author":{"role":"assistant"},'
@@ -862,7 +865,37 @@ def test_selection_fails_closed_without_any_anchor():
         eof=True, request_body=req_body("u-1"),
     )
     sel2 = select_turn_attempt([no_in_band], expected_user_message_id="u-1")
-    assert sel2.verdict == "no_user_anchor" and sel2.attempt is None
+    assert sel2.verdict == "matched" and sel2.attempt is no_in_band
+
+
+def test_selection_fresh_stream_without_in_band_anchor_uses_request_anchor():
+    """fresh 会话首 turn：流内无 input_message 帧（2026-10-04 实测 wire format），
+    归属退回 request 锚点，且跨 turn 污染防护不变。"""
+    # 无 in-band + request 锚点与期望一致 → matched（原行为在此静默拒绝）。
+    fresh = FakeAttempt(
+        "a-fresh", "text/event-stream",
+        sse('{"c":0,"v":{"message":{"id":"m-fresh","author":{"role":"assistant"},'
+            '"status":"in_progress","content":{"parts":[""]}}}}',
+            '{"c":1,"o":"patch","v":[{"p":"/message/content/parts/0","o":"append","v":"OK"},'
+            '{"p":"/message/status","o":"replace","v":"finished_successfully"},'
+            '{"p":"/message/end_turn","o":"replace","v":true}]}',
+            '{"type":"message_stream_complete","conversation_id":"c-fresh"}',
+            "[DONE]"),
+        error="AbortError: signal is aborted without reason",
+        request_body=req_body("u-fresh"),
+    )
+    sel = select_turn_attempt([fresh], expected_user_message_id="u-fresh")
+    assert sel.verdict == "matched" and sel.attempt is fresh
+    assert sel.parser.assistant_text == "OK"
+
+    # 无 in-band + request 锚点不是期望 id → 拒绝（旧 turn 晚到的 POST
+    # 不会携带本轮 id，这条防线必须保留）。
+    sel2 = select_turn_attempt([fresh], expected_user_message_id="u-other")
+    assert sel2.verdict == "user_id_mismatch" and sel2.attempt is None
+
+    # 无 in-band + 调用方不给期望 id → 无法归属，fail close。
+    sel3 = select_turn_attempt([fresh])
+    assert sel3.verdict == "no_user_anchor" and sel3.attempt is None
 
 
 def test_selection_reports_no_terminal_and_no_stream():

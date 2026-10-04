@@ -704,7 +704,13 @@ def select_from_parser_candidates(
          user 消息 id）必须与 ``in_band`` 完全一致；
        - attempt 自身 request body 里的 user message id 必须与 ``in_band``
          完全一致（自校验：流内容必须属于这条请求）；
-       - 两者都没有 = 无法归属 → 拒绝（``no_user_anchor``）。
+       - 两者都没有 = 无法归属 → 拒绝（``no_user_anchor``）；
+       - 实测例外（2026-10-04 验收现场）：fresh 会话首 turn 的 wire
+         format 不含 ``input_message`` 帧（user id 只以 ``parent_id`` /
+         ``message_id`` 出现在其它帧里），``in_band`` 恒为 None。此时退回
+         request 锚点做归属：POST body 里最后一条 user 消息 id 是每轮
+         客户端新生成的 uuid，晚到的旧 turn POST 不会携带本轮 id，与
+         ``expected_user_message_id`` 精确一致同样排除跨 turn 污染。
     3. 通过的候选取**最后一个**（前端 retry 的最终赢家）。
 
     这样前一轮 turn 的 late event / late retry 掉进本轮缓存时，会因
@@ -725,7 +731,12 @@ def select_from_parser_candidates(
         request_id = cand.request_user_message_id
         reason = None
         if in_band is None:
-            reason = "no_user_anchor"
+            if request_id is None or expected_user_message_id is None:
+                reason = "no_user_anchor"
+            elif request_id != expected_user_message_id:
+                reason = "user_id_mismatch"
+            # request 锚点与期望 id 精确一致：接受（fresh 流无 in-band
+            # 锚点的实测形态，见上方 docstring 的例外说明）。
         elif expected_user_message_id is not None and in_band != expected_user_message_id:
             reason = "user_id_mismatch"
         elif request_id is not None and in_band != request_id:
