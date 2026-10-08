@@ -133,7 +133,10 @@ async def test_send_acknowledged_when_user_count_increases(monkeypatch):
     driver._completion.had_non_text_content = False
 
     # The legacy completion path was removed; this test owns only the
-    # acknowledgement primitive's contract.
+    # acknowledgement primitive's contract: armed（in-flight send 已建立本轮
+    # baseline）时，userCount 增量 + composer 清空必须判 True。unarmed 时的
+    # inconclusive 契约由 section 4 单独覆盖。
+    driver._send_ack_armed = True
     assert await driver._verify_send_acknowledged() is True
 
 
@@ -178,6 +181,7 @@ async def test_missing_composer_returns_none_not_false():
     check, so an all-missing-composer run incorrectly returned False."""
     driver = _make_driver()
     driver._pre_send_user_count = 0
+    driver._send_ack_armed = True  # 直接调探针：模拟 in-flight send 已建立本轮 baseline
 
     async def fake_js_strict(expr, timeout=15):
         # Every probe returns valid JSON but composer is missing
@@ -195,3 +199,57 @@ async def test_missing_composer_returns_none_not_false():
     assert result is None, (
         f"Missing composer should return None (inconclusive), got {result!r}"
     )
+
+
+# ── 4. Request-scoped ack（2026-10-08 review HOLD）────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ack_probe_returns_none_without_an_armed_in_flight_send():
+    """探针必须 request-scoped：没有 in-flight send 持有自己的 baseline 时，
+    `_pre_send_user_count` 属于上一次（已结束的）send。用它比对当前 DOM 会把
+    "上一次发送后的 userCount 增量 + composer 已清空"误判成本次消息已被接受——
+    fire-and-forget（报告回发）的 ack 轮询恰好在这个窗口启动。必须返回 None
+    （inconclusive），让调用方继续轮询或 fail closed。"""
+    driver = _make_driver()
+    # 上一次 send 留下的 stale baseline + 上一次发送后的 DOM 状态（count 已增加、
+    # composer 已清空）——没有 armed 闸门时这正是误判 True 的现场。
+    driver._pre_send_user_count = 0
+
+    async def fake_js_strict(expr, timeout=15):
+        if "userCount" in expr and "composerEmpty" in expr:
+            return json.dumps({"userCount": 1, "composerPresent": True, "composerEmpty": True})
+        return "0"
+
+    driver._js_strict = fake_js_strict
+
+    assert driver._send_ack_armed is False
+    result = await driver._verify_send_acknowledged()
+
+    assert result is None, f"unarmed probe must be inconclusive, got {result!r}"
+
+
+@pytest.mark.asyncio
+async def test_send_and_stream_disarms_the_ack_probe_on_terminal_paths():
+    """send 结束（含失败）后探针必须回到 unarmed：baseline 不再属于任何
+    in-flight 请求，后续 fire-and-forget 轮询不能拿它做判定。"""
+    driver = _make_driver()
+    driver.type_message = AsyncMock()
+    driver.click_send = AsyncMock()
+    driver._read_assistant_count_baseline = AsyncMock(return_value=0)
+    driver._identity_listener = None
+    driver._assert_owned_tab_required = MagicMock()
+    driver._capture_pre_send_fallback_anchor = AsyncMock(return_value=MagicMock())
+
+    async def fake_js_strict(expr, timeout=15):
+        if "userCount" in expr and "composerEmpty" in expr:
+            return json.dumps({"userCount": 2, "composerPresent": True, "composerEmpty": False})
+        return "0"
+
+    driver._js_strict = fake_js_strict
+
+    with pytest.raises(Exception):
+        async for _ in driver.send_and_stream("test message", timeout=10):
+            pass
+
+    assert driver._send_ack_armed is False

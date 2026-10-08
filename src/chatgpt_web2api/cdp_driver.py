@@ -390,6 +390,12 @@ class CDPDriver:
         self._last_refresh_attempt_at: float = 0.0
         self._current_conv_id: str | None = None
         self._current_model: str | None = None
+        # Send-ack 探针的作用域闸门：只有一次 in-flight send 自己建立了 baseline 之后，
+        # _verify_send_acknowledged 才允许返回判定（2026-10-08 review HOLD）。
+        # 没有它，fire-and-forget（报告回发）的 ack 轮询会在 upstream task 尚未建立
+        # 本轮 baseline 时看到上一次 send 的 baseline=N + 当前 DOM userCount=N+1 +
+        # composer 空 → 误判"已发出"，而真实的那条消息可能根本没发出去。
+        self._send_ack_armed = False
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
@@ -1962,6 +1968,13 @@ class CDPDriver:
         if pre_send_count is None:
             # No baseline — can't verify a delta. Non-blocking.
             return None
+        if not getattr(self, "_send_ack_armed", False):
+            # 没有 in-flight send 持有自己的 baseline：此刻读到的 `_pre_send_user_count`
+            # 属于上一次（已结束的）send。用它比对当前 DOM 会把"上一次发送后的
+            # userCount 增量 + composer 已清空"误判成本次消息已被接受（request-scoped
+            # 缺失时的实测 race）。tri-state 语义下 None = 不确定，调用方继续轮询或
+            # fail closed，不会把未发出的消息当成已投递。
+            return None
 
         deadline = _time.monotonic() + 3.0
         valid_probe_seen = False
@@ -2127,7 +2140,10 @@ class CDPDriver:
         # Text completion is now event-driven end-to-end. Keep a best-effort
         # user-count baseline only for the send-ack safety net; it is a single
         # pre-send DOM read, never completion polling.
+        # Baseline 是本次 send 的请求作用域资产：重读完成前 armed 必须保持 False，
+        # ack 探针才不会拿上一次 send 的 baseline 做判定。
         self._pre_send_user_count = None
+        self._send_ack_armed = False
         try:
             raw_user_count = await self._js_strict(
                 "document.querySelectorAll("
@@ -2137,6 +2153,7 @@ class CDPDriver:
             self._pre_send_user_count = int(raw_user_count)
         except Exception:
             pass
+        self._send_ack_armed = True
 
         capture_scope = None
         if self._identity_listener is not None:
@@ -2315,6 +2332,9 @@ class CDPDriver:
             # A2 Step 9: ALWAYS clear the capture scope (failure-mode E).
             if capture_scope is not None:
                 capture_scope.close()
+            # send 结束后 baseline 不再属于任何 in-flight 请求，ack 探针回到
+            # inconclusive（None），直到下一次 send 重新建立自己的 baseline。
+            self._send_ack_armed = False
 
         yield StreamChunk(delta="", finish_reason="stop")
 
