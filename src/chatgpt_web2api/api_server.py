@@ -340,6 +340,12 @@ class APIServer:
             else:
                 _port, _key = self._cdp_port, None
             async with MutationLock(_port, _key):
+                # Send-ack 请求作用域（2026-10-08 review 第二轮 HOLD）：MutationLock 的
+                # 持有者才拥有当前 in-flight send 的 ack baseline。bridge 为每个请求带
+                # X-Gaifan-Mutation-Token，其 ack 探针只在 owner 匹配时得到判定；排队
+                # 等锁的请求探针一律 inconclusive，不会消费上一个请求的 ack。token 每请求
+                # 新生成，请求结束后残留的 owner 值不可能被后续请求匹配复用。
+                self._driver._send_ack_owner = request.headers.get("X-Gaifan-Mutation-Token") or None
                 # Drift guard (parallel mode only): if the owned target changed
                 # while we waited for the lock, the key we hold no longer names
                 # the active tab. Fail retryably instead of mutating under a

@@ -396,6 +396,12 @@ class CDPDriver:
         # 本轮 baseline 时看到上一次 send 的 baseline=N + 当前 DOM userCount=N+1 +
         # composer 空 → 误判"已发出"，而真实的那条消息可能根本没发出去。
         self._send_ack_armed = False
+        # 请求作用域（2026-10-08 review 第二轮 HOLD）：armed 只解决"探针不能读已结束
+        # send 的 baseline"，不解决跨请求误判——A 的 completion 仍持 MutationLock 时
+        # armed 保持 True，排队中的 B 的探针会消费 A 的 ack。_handle_chat 在持有
+        # MutationLock 期间把请求 token 写到这里；探针只在 token 匹配（= 我的请求正
+        # 拥有 mutation、这个 baseline 属于我的 send）时才允许判定，其余一律 None。
+        self._send_ack_owner: str | None = None
         # CDP response routing (#7): id-keyed futures + background reader
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
@@ -1941,7 +1947,7 @@ class CDPDriver:
         # Unreachable (the loop either returns or raises).
         raise SendReadinessError("send_baseline: exhausted retries unexpectedly")
 
-    async def _verify_send_acknowledged(self) -> bool | None:
+    async def _verify_send_acknowledged(self, request_token: str | None = None) -> bool | None:
         """P0 send acknowledgment (ChatGPT review, conv 6a52f0f3).
 
         After click_send dispatches synthetic mouse events, verify the message
@@ -1952,17 +1958,27 @@ class CDPDriver:
         detect the delta, not just "userCount > 0" (which is always true on
         existing conversations).
 
+        ``request_token``（2026-10-08 review 第二轮 HOLD）把探针绑定到具体请求：
+        只有当前 armed baseline 的 owner（= 正持有 MutationLock 的那个请求，由
+        ``_handle_chat`` 登记）与 token 一致时才允许判定。跨请求轮询（比如排队等锁
+        的 fire-and-forget 撞上前一个请求仍在进行的 completion）一律返回 None，
+        防止排队请求消费别人的 ack 而被误判 accepted。
+
         Tri-state return:
           - True: acknowledged (count increased AND composer cleared)
           - False: conclusively NOT acknowledged (valid probes showed no delta)
           - None: probe inconclusive (CDP errors, no valid probe obtained,
-            missing composer, or no pre-send baseline) — non-blocking
+            missing composer, no pre-send baseline, or token mismatch) — non-blocking
 
         Polls briefly (3s at 0.5s intervals). Never raises.
         """
         import time as _time
 
         from .chatgpt_dom import COMPOSER_FALLBACK_SELECTOR, COMPOSER_SELECTOR
+
+        if request_token is not None and getattr(self, "_send_ack_owner", None) != request_token:
+            # token 不匹配：当前 armed baseline 属于另一个（还没交出锁的）请求。
+            return None
 
         pre_send_count = getattr(self, "_pre_send_user_count", None)
         if pre_send_count is None:

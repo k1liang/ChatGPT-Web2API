@@ -253,3 +253,112 @@ async def test_send_and_stream_disarms_the_ack_probe_on_terminal_paths():
             pass
 
     assert driver._send_ack_armed is False
+
+
+@pytest.mark.asyncio
+async def test_ack_probe_returns_none_when_request_token_mismatches_owner():
+    """跨请求竞态（review 第二轮 HOLD P1）：A 的 completion 还持有 MutationLock
+    （owner=A）时，排队的 B 带 B 的 token 探针——即使 DOM 已是"userCount 增加 +
+    composer 清空"，那也是 A 的 baseline 消费出来的判定，B 必须拿到 None。"""
+    driver = _make_driver()
+    driver._pre_send_user_count = 0
+    driver._send_ack_armed = True
+    driver._send_ack_owner = "token-a"  # A 的 send 还在持有 mutation
+
+    async def fake_js_strict(expr, timeout=15):
+        if "userCount" in expr and "composerEmpty" in expr:
+            return json.dumps({"userCount": 1, "composerPresent": True, "composerEmpty": True})
+        return "0"
+
+    driver._js_strict = fake_js_strict
+
+    result = await driver._verify_send_acknowledged("token-b")
+    assert result is None, f"token mismatch must be inconclusive, got {result!r}"
+
+
+@pytest.mark.asyncio
+async def test_ack_probe_judges_only_for_the_matching_request_token():
+    """owner 匹配（= 我的请求正持有 mutation、baseline 属于我的 send）时，
+    探针按原 tri-state 语义给出判定。"""
+    driver = _make_driver()
+    driver._pre_send_user_count = 0
+    driver._send_ack_armed = True
+    driver._send_ack_owner = "token-a"
+
+    async def fake_js_strict(expr, timeout=15):
+        if "userCount" in expr and "composerEmpty" in expr:
+            return json.dumps({"userCount": 1, "composerPresent": True, "composerEmpty": True})
+        return "0"
+
+    driver._js_strict = fake_js_strict
+
+    assert await driver._verify_send_acknowledged("token-a") is True
+
+
+@pytest.mark.asyncio
+async def test_handle_chat_registers_mutation_owner_from_token_header(monkeypatch):
+    """_handle_chat 拿到 MutationLock 后必须把请求 token 登记为 _send_ack_owner；
+    无 token 头（MCP / 非 bridge 调用方）登记 None。owner 不清理是刻意为之：
+    token 每请求新生成，残留值不可能被后续请求匹配复用，而下一个 REST 持有者
+    一定会覆盖它。"""
+    import chatgpt_web2api.api_server as srv
+
+    def _make_server():
+        server = srv.APIServer.__new__(srv.APIServer)  # bypass __init__
+        server._last_conv_id = "conv-rest-1"
+        server._last_project_id = None
+        server._request_count = 0
+        server._cdp_port = 9222
+        server._parallel_tabs = False
+        server._config = srv.Config.load(None)
+        server._breakers = srv.BreakerRegistry()
+        server._last_error = None
+        driver = MagicMock()
+        driver._current_conv_id = "conv-rest-1"
+        driver._current_model = None
+        driver.select_model = AsyncMock(return_value=True)
+        driver.ensure_current_conversation = AsyncMock()
+        driver._send_ack_owner = "stale-from-an-earlier-request"
+        server._driver = driver
+        reached = {"past_guard": False}
+
+        async def _stub_response(*a, **kw):
+            reached["past_guard"] = True
+            return MagicMock()
+
+        server._full_response = _stub_response
+        server._stream_response = _stub_response
+        return server, driver, reached
+
+    class _NullLock:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(srv, "MutationLock", _NullLock)
+
+    async def _fake_json():
+        return {"messages": [{"role": "user", "content": "hello"}], "model": "auto"}
+
+    # 带 token：进入锁作用域后 owner 被覆盖为本请求的 token。
+    server, driver, reached = _make_server()
+    request = MagicMock()
+    request.headers = {"X-Gaifan-Mutation-Token": "token-b"}
+    request.json = AsyncMock(side_effect=_fake_json)
+    await server._handle_chat(request)
+    assert reached["past_guard"] is True
+    assert driver._send_ack_owner == "token-b"
+
+    # 无 token 头：owner 归 None（fail closed），不保留更早的残留值。
+    server, driver, reached = _make_server()
+    request = MagicMock()
+    request.headers = {}
+    request.json = AsyncMock(side_effect=_fake_json)
+    await server._handle_chat(request)
+    assert reached["past_guard"] is True
+    assert driver._send_ack_owner is None
