@@ -257,7 +257,7 @@ class ChatGPTDom:
         # Focus the composer. Try the ProseMirror textbox first, then the
         # legacy textarea fallback. Returns which one was focused (or
         # 'no composer') so the verify step reads the right element.
-        focus_result = await d._js(
+        focus_js = (
             "(function() {"
             f"  var el = {first_visible_composer_js(COMPOSER_SELECTOR)};"
             "  if (el) { el.focus(); return 'composer'; }"
@@ -266,7 +266,15 @@ class ChatGPTDom:
             "  return 'no composer';"
             "})()"
         )
-        if focus_result == "no composer":
+        focus_result = await d._js(focus_js)
+        # Project navigation may briefly mount then unmount the composer.
+        # Retry only focus, before any text insertion; never resend a request.
+        for _ in range(30):
+            if focus_result != "no composer":
+                break
+            await asyncio.sleep(0.5)
+            focus_result = await d._js(focus_js)
+        if focus_result not in ("composer", "fallback"):
             await d._capture_selector_diagnostic("composer (type_message)")
             if d._breakers:
                 d._breakers.record_failure(BreakerKind.COMPOSER_SEND_READINESS)

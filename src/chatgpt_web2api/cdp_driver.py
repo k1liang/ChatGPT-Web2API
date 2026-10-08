@@ -1594,6 +1594,8 @@ class CDPDriver:
             # composer after 20s; ``?model=auto`` → composer present.
             url = "https://chatgpt.com/?model=auto"
         logger.info("Navigate: %s", url)
+        # Invalidate the old conversation even if navigation fails or times out.
+        self._current_conv_id = None
         await self._cdp("Page.navigate", {"url": url})
         await asyncio.sleep(2)
 
@@ -1624,9 +1626,16 @@ class CDPDriver:
                 pass
             await asyncio.sleep(0.5)
 
-        # Settle time for sentinel init
+        else:
+            await self._capture_selector_diagnostic("composer (navigate_new_chat)")
+            raise SendReadinessError("New chat navigation did not reach a composer")
+
+        # The early composer can unmount while the project shell loads.
+        # Revalidate after settling, before allowing any send.
         await asyncio.sleep(2)
-        self._current_conv_id = None
+        if not await self._wait_for_composer(timeout=15):
+            await self._capture_selector_diagnostic("composer (navigate_new_chat post-settle)")
+            raise SendReadinessError("New chat composer not ready after navigation")
 
     async def _has_composer(self) -> bool:
         """Is a send-capable composer present on the live tab?

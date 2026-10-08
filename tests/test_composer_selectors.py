@@ -102,6 +102,7 @@ async def test_type_message_fails_loudly_when_no_composer(monkeypatch):
         return "no composer"
     d._js = _fake_js
     d._capture_selector_diagnostic = AsyncMock()
+    monkeypatch.setattr("chatgpt_web2api.chatgpt_dom.asyncio.sleep", AsyncMock())
 
     with pytest.raises(RuntimeError, match="No composer"):
         await d.type_message("hello")
