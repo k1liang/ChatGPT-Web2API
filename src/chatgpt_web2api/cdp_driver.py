@@ -39,6 +39,7 @@ class StreamChunk:
 
     delta: str
     finish_reason: str | None = None
+    non_text_result: dict | None = None
 
 
 # Conservative fallback wait (seconds) when ChatGPT's pop-up gives no exact
@@ -431,6 +432,11 @@ class CDPDriver:
         self._turn_stream_runtime = None
         self._stream_primary_available = False
         self._stream_primary_reason = "not_prepared"
+        # Exact-turn WebSocket non-text/image runtime.  It observes only
+        # structural asset/terminal fields and retains no raw WS payload.
+        self._turn_nontext_runtime = None
+        self._nontext_available = False
+        self._nontext_reason = "not_prepared"
         # Event-driven DOM secondary. Dormant on stream-primary success; it is
         # armed with the exact captured user UUID only after stream failure or
         # when stream primary is unavailable.
@@ -676,6 +682,27 @@ class CDPDriver:
         await self._turn_stream_runtime.start(self._page_stream_hook)
         return self._turn_stream_runtime
 
+    async def _ensure_turn_nontext_runtime(self):
+        from .turn_nontext_runtime import TurnNonTextRuntime
+
+        if self._turn_nontext_runtime is None:
+            self._turn_nontext_runtime = TurnNonTextRuntime(self)
+        await self._turn_nontext_runtime.start()
+        return self._turn_nontext_runtime
+
+    async def _prepare_nontext_after_attach(self) -> bool:
+        self._nontext_available = False
+        self._nontext_reason = "preparing"
+        try:
+            await self._ensure_turn_nontext_runtime()
+        except Exception as e:
+            logger.warning("nontext-runtime attach failed: %s", e)
+            self._nontext_reason = "attach_failed"
+            return False
+        self._nontext_available = True
+        self._nontext_reason = "ready"
+        return True
+
     async def _page_stream_wrapper_present(self) -> bool:
         try:
             value = await self._js_strict("Boolean(window.__w2aWrappedFetch)")
@@ -771,6 +798,11 @@ class CDPDriver:
             "expected_user_id": None,
             "dom_secondary_available": self._dom_secondary_available,
             "dom_secondary_reason": self._dom_secondary_reason,
+            "non_text_available": self._nontext_available,
+            "non_text_reason": self._nontext_reason,
+            "non_text_outcome": None,
+            "non_text_resolution": None,
+            "non_text_asset_count": 0,
             "dom_outcome": None,
             "dom_conversation_id": None,
             "winning_attempt": None,
@@ -790,6 +822,8 @@ class CDPDriver:
         out = dict(self._stream_primary_stats)
         if self._turn_stream_runtime is not None:
             out["runtime"] = self._turn_stream_runtime.stats
+        if self._turn_nontext_runtime is not None:
+            out["non_text_runtime"] = self._turn_nontext_runtime.stats
         return out
 
     @property
@@ -952,6 +986,7 @@ class CDPDriver:
         await self._prepare_stream_primary_after_attach()
         await self._prepare_dom_secondary_after_attach()
         await self._refresh_token()
+        await self._prepare_nontext_after_attach()
         # Establish the send-readiness invariant before connect() returns: a
         # connected driver must be able to type a message. connect() may have
         # attached to a chatgpt.com/ home/landing tab (or adopted an arbitrary
@@ -1084,6 +1119,10 @@ class CDPDriver:
         self._stream_primary_reason = "reconnecting"
         self._dom_secondary_available = False
         self._dom_secondary_reason = "reconnecting"
+        self._nontext_available = False
+        self._nontext_reason = "reconnecting"
+        if self._turn_nontext_runtime is not None:
+            self._turn_nontext_runtime.reset_session()
         if self._page_stream_hook is not None:
             self._page_stream_hook.mark_session_lost()
         if self._turn_stream_runtime is not None:
@@ -1168,6 +1207,7 @@ class CDPDriver:
                 await self._attach_identity_listener()
                 # Phase A: re-attach the diagnostic turn network listener.
                 await self._attach_turn_network_listener()
+                await self._prepare_nontext_after_attach()
                 # Phase A 第二方案: Fetch 捕获是 websocket 级状态，重连后
                 # 必须重新 enable，否则实验中途断线会静默丢失观测。
                 await self._reattach_fetch_stream_capture()
@@ -2192,8 +2232,15 @@ class CDPDriver:
             self._dom_secondary_available
             and self._turn_dom_runtime is not None
         )
+        use_nontext = (
+            self._nontext_available
+            and self._turn_nontext_runtime is not None
+        )
         stream_context = (
             self._turn_stream_runtime.begin_turn() if use_stream_primary else None
+        )
+        nontext_context = (
+            self._turn_nontext_runtime.begin_turn() if use_nontext else None
         )
         # No textual path performs a pre-send projection GET. The captured
         # POST UUID is the authority for both event-driven completion transports.
@@ -2205,13 +2252,17 @@ class CDPDriver:
                 target_id=self._target_id,
             )
 
+        stream_wait_task = None
+        dom_wait_task = None
+        nontext_wait_task = None
+        captured_uuid = None
+
         try:
             # Type and send.
             await self.type_message(text)
             await self.click_send()
 
             # A2 Step 6: wait for the IdentityListener to capture the UUID.
-            captured_uuid = None
             if capture_scope is not None:
                 captured_uuid = await self._identity_listener.wait_for_captured_uuid(timeout=5.0)
 
@@ -2250,27 +2301,46 @@ class CDPDriver:
             # A2 Step 7: build the final anchor (fallback + captured UUID).
             turn_anchor = fallback_anchor.with_captured_id(captured_uuid)
 
-            # Textual completion hierarchy:
-            #   response stream -> exact-turn MutationObserver -> typed fail-close.
-            # Automatic projection recovery was falsified by the secondary matrix;
-            # the old CompletionDetector polling loop is deliberately absent.
+            # Production completion races two independent exact-turn primary
+            # observations:
+            #   textual response stream
+            #   WebSocket non-text asset+terminal contract
+            # Text never falls through to non-text: ownership is the same captured
+            # user UUID, and the non-text runtime additionally requires a final tool
+            # image asset plus a matching assistant end-turn.  DOM remains the
+            # textual secondary only after stream failure/unavailability.
             stream_result = None
+            dom_result = None
+            nontext_result = None
             completion_deadline = time.monotonic() + timeout
             if captured_uuid:
                 self._stream_primary_stats["expected_user_id"] = captured_uuid
 
-            if use_stream_primary and captured_uuid and stream_context is not None:
-                stream_result = await self._turn_stream_runtime.wait_for_turn(
-                    captured_uuid, timeout=timeout, context=stream_context
+            async def resolve_nontext_task(task):
+                nonlocal nontext_result
+                nontext_result = await task
+                self._stream_primary_stats["non_text_outcome"] = nontext_result.verdict
+                diag = nontext_result.diagnostic or {}
+                self._stream_primary_stats["non_text_asset_count"] = int(
+                    diag.get("asset_candidates") or 0
                 )
-                diag = stream_result.diagnostic or {}
+                if not nontext_result.matched:
+                    return None
+                resolved = await self._turn_nontext_runtime.resolve_result(nontext_result)
+                self._stream_primary_stats["non_text_resolution"] = resolved.verdict
+                if not resolved.matched:
+                    return None
+                return resolved.payload
+
+            def record_stream_result(result):
+                diag = result.diagnostic or {}
                 attempts = diag.get("attempts") or []
                 self._stream_primary_stats.update(
                     {
-                        "winning_attempt": stream_result.attempt_id,
+                        "winning_attempt": result.attempt_id,
                         "attempt_count": diag.get("attempt_count", 0),
                         "retry_count": diag.get("retry_count", 0),
-                        "outcome": stream_result.verdict,
+                        "outcome": result.verdict,
                         "protocol_drift": any(
                             bool(a.get("protocol_drift")) for a in attempts
                         ),
@@ -2280,62 +2350,176 @@ class CDPDriver:
                         ),
                     }
                 )
-                if stream_result.matched:
-                    self._stream_primary_stats["completion_source"] = "stream"
-                    if stream_result.conversation_id:
-                        self._current_conv_id = stream_result.conversation_id
-                    if stream_result.assistant_text:
-                        yield StreamChunk(delta=stream_result.assistant_text)
-                    yield StreamChunk(delta="", finish_reason="stop")
-                    return
+
+            if (
+                captured_uuid
+                and use_nontext
+                and nontext_context is not None
+            ):
+                nontext_wait_task = asyncio.create_task(
+                    self._turn_nontext_runtime.wait_for_turn(
+                        captured_uuid, timeout=timeout, context=nontext_context
+                    )
+                )
+
+            if use_stream_primary and captured_uuid and stream_context is not None:
+                stream_wait_task = asyncio.create_task(
+                    self._turn_stream_runtime.wait_for_turn(
+                        captured_uuid, timeout=timeout, context=stream_context
+                    )
+                )
+                if nontext_wait_task is not None:
+                    remaining = max(0.1, completion_deadline - time.monotonic())
+                    done, _ = await asyncio.wait(
+                        {stream_wait_task, nontext_wait_task},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if nontext_wait_task in done:
+                        payload = await resolve_nontext_task(nontext_wait_task)
+                        if payload is not None:
+                            self._stream_primary_stats["completion_source"] = "ws_non_text"
+                            self._current_conv_id = payload["conversation_id"]
+                            yield StreamChunk(
+                                delta=json.dumps(
+                                    payload, ensure_ascii=False, separators=(",", ":")
+                                ),
+                                non_text_result=payload,
+                            )
+                            yield StreamChunk(delta="", finish_reason="stop")
+                            return
+                        nontext_wait_task = None
+                    if stream_wait_task in done:
+                        stream_result = await stream_wait_task
+                    else:
+                        remaining = max(0.1, completion_deadline - time.monotonic())
+                        try:
+                            stream_result = await asyncio.wait_for(
+                                stream_wait_task, timeout=remaining
+                            )
+                        except TimeoutError:
+                            stream_result = None
+                else:
+                    stream_result = await stream_wait_task
+
+                if stream_result is not None:
+                    record_stream_result(stream_result)
+                    if stream_result.matched:
+                        self._stream_primary_stats["completion_source"] = "stream"
+                        if stream_result.conversation_id:
+                            self._current_conv_id = stream_result.conversation_id
+                        if stream_result.assistant_text:
+                            yield StreamChunk(delta=stream_result.assistant_text)
+                        yield StreamChunk(delta="", finish_reason="stop")
+                        return
             elif use_stream_primary:
                 self._stream_primary_stats["outcome"] = "missing_user_anchor"
 
-            dom_result = None
             if captured_uuid and use_dom_secondary:
                 remaining = max(0.1, completion_deadline - time.monotonic())
-                dom_result = await self._turn_dom_runtime.wait_for_turn(
-                    captured_uuid, timeout=remaining
-                )
-                self._stream_primary_stats["dom_outcome"] = dom_result.verdict
-                self._stream_primary_stats["dom_conversation_id"] = dom_result.conversation_id
-                if dom_result.matched:
-                    self._stream_primary_stats["completion_source"] = "dom_secondary"
-                    if dom_result.conversation_id:
-                        self._current_conv_id = dom_result.conversation_id
-                    if dom_result.assistant_text:
-                        yield StreamChunk(delta=dom_result.assistant_text)
-                    yield StreamChunk(delta="", finish_reason="stop")
-                    return
-                # A2.18 real S8 assay falsified DOM non-text completion:
-                # the exact-turn observer timed out with no assistant node at all.
-                # Keep non_text as a diagnostic verdict if the DOM ever emits it,
-                # but never promote it to a successful model completion without a
-                # separately established non-text protocol.
-                if dom_result.verdict == "non_text":
-                    logger.warning(
-                        "dom_non_text_unverified: refusing placeholder success for turn %s",
-                        captured_uuid,
+                dom_wait_task = asyncio.create_task(
+                    self._turn_dom_runtime.wait_for_turn(
+                        captured_uuid, timeout=remaining
                     )
+                )
+                if nontext_wait_task is not None:
+                    done, _ = await asyncio.wait(
+                        {dom_wait_task, nontext_wait_task},
+                        timeout=remaining,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if nontext_wait_task in done:
+                        payload = await resolve_nontext_task(nontext_wait_task)
+                        if payload is not None:
+                            self._stream_primary_stats["completion_source"] = "ws_non_text"
+                            self._current_conv_id = payload["conversation_id"]
+                            yield StreamChunk(
+                                delta=json.dumps(
+                                    payload, ensure_ascii=False, separators=(",", ":")
+                                ),
+                                non_text_result=payload,
+                            )
+                            yield StreamChunk(delta="", finish_reason="stop")
+                            return
+                        nontext_wait_task = None
+                    if dom_wait_task in done:
+                        dom_result = await dom_wait_task
+                    else:
+                        remaining = max(0.1, completion_deadline - time.monotonic())
+                        try:
+                            dom_result = await asyncio.wait_for(
+                                dom_wait_task, timeout=remaining
+                            )
+                        except TimeoutError:
+                            dom_result = None
+                else:
+                    dom_result = await dom_wait_task
 
-            # Both event-driven transports are authoritative for textual
-            # completion. Automatic projection recovery was rejected by the
+                if dom_result is not None:
+                    self._stream_primary_stats["dom_outcome"] = dom_result.verdict
+                    self._stream_primary_stats["dom_conversation_id"] = (
+                        dom_result.conversation_id
+                    )
+                    if dom_result.matched:
+                        self._stream_primary_stats["completion_source"] = "dom_secondary"
+                        if dom_result.conversation_id:
+                            self._current_conv_id = dom_result.conversation_id
+                        if dom_result.assistant_text:
+                            yield StreamChunk(delta=dom_result.assistant_text)
+                        yield StreamChunk(delta="", finish_reason="stop")
+                        return
+                    if dom_result.verdict == "non_text":
+                        logger.debug(
+                            "dom non-text observed for %s; waiting for WS contract",
+                            captured_uuid,
+                        )
+
+            # If textual observation finished first without a successful result,
+            # give the independent non-text contract the remaining deadline.
+            if nontext_wait_task is not None:
+                remaining = max(0.1, completion_deadline - time.monotonic())
+                try:
+                    await asyncio.wait_for(nontext_wait_task, timeout=remaining)
+                except TimeoutError:
+                    pass
+                if nontext_wait_task.done() and not nontext_wait_task.cancelled():
+                    payload = await resolve_nontext_task(nontext_wait_task)
+                    if payload is not None:
+                        self._stream_primary_stats["completion_source"] = "ws_non_text"
+                        self._current_conv_id = payload["conversation_id"]
+                        yield StreamChunk(
+                            delta=json.dumps(
+                                payload, ensure_ascii=False, separators=(",", ":")
+                            ),
+                            non_text_result=payload,
+                        )
+                        yield StreamChunk(delta="", finish_reason="stop")
+                        return
+
+            # All exact-turn event transports failed to establish a result.
+            # Automatic projection recovery was rejected by the
             # 2026-09-28 secondary matrix: even one GET per failed turn hit
             # HTTP 429 under repeated S5 turns. Do not add retries/backoff here;
             # fail closed and leave projection as an explicit read/debug API.
             if not captured_uuid:
                 last_status = "missing_user_anchor"
-            elif stream_result is None and dom_result is None:
+            elif (
+                stream_result is None
+                and dom_result is None
+                and nontext_result is None
+            ):
                 last_status = "no_event_completion_transport"
             else:
                 last_status = (
                     getattr(dom_result, "verdict", None)
+                    or getattr(nontext_result, "verdict", None)
                     or getattr(stream_result, "verdict", None)
                     or "event_completion_failed"
                 )
             raise TurnReconciliationError(
                 conversation_id=(
                     getattr(dom_result, "conversation_id", None)
+                    or getattr(nontext_result, "conversation_id", None)
                     or getattr(stream_result, "conversation_id", None)
                     or self._current_conv_id
                     or ""
@@ -2345,15 +2529,40 @@ class CDPDriver:
                 diagnostic={
                     "stream_available": use_stream_primary,
                     "dom_available": use_dom_secondary,
+                    "non_text_available": use_nontext,
                     "stream": getattr(stream_result, "diagnostic", None),
                     "stream_outcome": getattr(stream_result, "verdict", None),
                     "dom": getattr(dom_result, "diagnostic", None),
                     "dom_outcome": getattr(dom_result, "verdict", None),
+                    "non_text": getattr(nontext_result, "diagnostic", None),
+                    "non_text_outcome": getattr(nontext_result, "verdict", None),
                     "projection_recovery": "disabled_after_429_falsification",
                 },
             )
 
         finally:
+            # Cancel losing completion tasks.  Non-text/DOM runtimes clean up
+            # their turn scopes in finally; stream attempts need an explicit
+            # drop because the legacy sequential path never cancelled them.
+            for task in (stream_wait_task, dom_wait_task, nontext_wait_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in (stream_wait_task, dom_wait_task, nontext_wait_task):
+                if task is not None:
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+            if (
+                captured_uuid
+                and stream_wait_task is not None
+                and self._turn_stream_runtime is not None
+            ):
+                discard_turn = getattr(
+                    self._turn_stream_runtime, "discard_turn", None
+                )
+                if callable(discard_turn):
+                    discard_turn(captured_uuid)
             # A2 Step 9: ALWAYS clear the capture scope (failure-mode E).
             if capture_scope is not None:
                 capture_scope.close()
@@ -2590,6 +2799,8 @@ class CDPDriver:
             await self._turn_stream_runtime.stop()
         if self._turn_dom_runtime is not None:
             await self._turn_dom_runtime.stop()
+        if self._turn_nontext_runtime is not None:
+            await self._turn_nontext_runtime.stop()
         # Stop the background reader first
         if self._reader_task and not self._reader_task.done():
             self._reader_task.cancel()

@@ -373,6 +373,10 @@ class TurnStreamRuntime:
                 self._drop_turn(expected_user_message_id)
                 return result
 
+    def discard_turn(self, user_message_id: str) -> None:
+        """Drop buffered attempts for a cancelled/externally-resolved turn."""
+        self._drop_turn(user_message_id)
+
     def _drop_turn(self, user_message_id: str) -> None:
         remove = set()
         for aid, state in self._attempts.items():
